@@ -1,0 +1,1003 @@
+#!/usr/bin/env python3
+"""git slice: path-scoped branches derived from another branch.
+
+A slice names a set of paths (for example docs/) and a base branch (for
+example main).  `git slice update <name>` rebuilds the branch
+slice/<name>/<from> as <base> plus the commits on <from> that touch the
+slice's paths, each restricted to those paths, skipping whatever <base>
+already contains.  The result can be pull-requested into <base> on its own.
+
+State kept per (slice, source branch), as refs under refs/slices/:
+  .../source   the source tip at the last successful update
+  .../landed   the source commit up to which everything is known to be in base
+
+The derived branch is disposable and is rebuilt from base on every update.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence, Tuple
+
+VERSION = "0.1.0"
+SHARED_FILE = ".gitslices"
+REF_ROOT = "refs/slices"
+BRANCH_ROOT = "slice"
+TRAILER = "Sliced-From"
+MARK_TRAILER = "Slice"
+SELECTS = ("all", "pure", "marked")
+MIN_GIT = (2, 22)
+
+
+class SliceError(Exception):
+    pass
+
+
+def _b(s):
+    return s if isinstance(s, (bytes, type(None))) else s.encode("utf-8", "surrogateescape")
+
+
+def _s(b):
+    return b.decode("utf-8", "replace")
+
+
+def _clean_env():
+    env = dict(os.environ)
+    for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY"):
+        env.pop(k, None)
+    return env
+
+
+def short(sha):
+    return sha[:10]
+
+
+# --------------------------------------------------------------------- repo
+
+class Repo:
+    def __init__(self):
+        rc, out, err = self._exec(["rev-parse", "--show-toplevel"], os.getcwd())
+        if rc != 0:
+            raise SliceError("not inside a git work tree")
+        self.top = _s(out).strip()
+        self.common = os.path.abspath(os.path.join(self.top, self.run("rev-parse", "--git-common-dir").strip()))
+        wt_root = os.path.join(self.common, "slice", "wt")
+        if os.path.realpath(self.top).startswith(os.path.realpath(wt_root) + os.sep):
+            # invoked from inside one of our temporary worktrees: use the main one
+            first = self.run("worktree", "list", "--porcelain").splitlines()[0]
+            self.top = first[len("worktree "):]
+        self._features = None
+
+    @staticmethod
+    def _exec(args, cwd, input=None, env=None):
+        p = subprocess.run(["git", *args], cwd=cwd, input=_b(input),
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        return p.returncode, p.stdout, p.stderr
+
+    def try_run(self, *args, input=None, cwd=None, binary=False, env_extra=None) -> Tuple[int, object, str]:
+        env = _clean_env() if (cwd or env_extra) else None
+        if env_extra:
+            env.update(env_extra)
+        rc, out, err = self._exec(list(args), cwd or self.top, input, env)
+        return rc, (out if binary else _s(out)), _s(err)
+
+    def run(self, *args, input=None, cwd=None, binary=False, env_extra=None):
+        rc, out, err = self.try_run(*args, input=input, cwd=cwd, binary=binary, env_extra=env_extra)
+        if rc != 0:
+            raise SliceError("git %s failed:\n%s" % (" ".join(args[:2]), err.strip()))
+        return out
+
+    # refs -------------------------------------------------------------
+    def rev(self, rev) -> Optional[str]:
+        rc, out, _ = self.try_run("rev-parse", "--verify", "--quiet", rev + "^{commit}")
+        return out.strip() if rc == 0 else None
+
+    def is_ancestor(self, a, b) -> bool:
+        rc, _, err = self.try_run("merge-base", "--is-ancestor", a, b)
+        if rc not in (0, 1):
+            raise SliceError(err.strip())
+        return rc == 0
+
+    def update_ref(self, ref, sha):
+        self.run("update-ref", ref, sha)
+
+    def delete_ref(self, ref):
+        self.try_run("update-ref", "-d", ref)
+
+    def current_branch(self) -> Optional[str]:
+        rc, out, _ = self.try_run("symbolic-ref", "--short", "-q", "HEAD")
+        return out.strip() if rc == 0 else None
+
+    def branch_checked_out_at(self, branch) -> Optional[str]:
+        path = None
+        for line in self.run("worktree", "list", "--porcelain").splitlines():
+            if line.startswith("worktree "):
+                path = line[len("worktree "):]
+            elif line == "branch refs/heads/" + branch:
+                return path
+        return None
+
+    def worktree_registered(self, path) -> bool:
+        real = os.path.realpath(path)
+        for line in self.run("worktree", "list", "--porcelain").splitlines():
+            if line.startswith("worktree ") and os.path.realpath(line[len("worktree "):]) == real:
+                return True
+        return False
+
+    def check_ref_format(self, branch):
+        rc, _, _ = self.try_run("check-ref-format", "--branch", branch)
+        if rc != 0:
+            raise SliceError("'%s' is not a valid branch name" % branch)
+
+    # features ---------------------------------------------------------
+    def features(self) -> Dict[str, bool]:
+        if self._features is None:
+            m = re.search(r"(\d+)\.(\d+)", self.run("--version"))
+            ver = (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+            if ver < MIN_GIT:
+                raise SliceError("git slice needs git %d.%d or newer" % MIN_GIT)
+            _, out, err = self.try_run("am", "-h")
+            _, mt_out, mt_err = self.try_run("merge-tree", "-h")
+            self._features = {"am_no_verify": "--no-verify" in out + err,
+                              "merge_tree_write": "--write-tree" in mt_out + mt_err}
+        return self._features
+
+
+# ------------------------------------------------------------------- config
+
+@dataclass
+class Slice:
+    name: str
+    paths: List[str] = field(default_factory=list)
+    base: Optional[str] = None
+    select: str = "all"
+    subject: Optional[str] = None
+    where: List[str] = field(default_factory=list)
+
+
+def _config_entries(repo, file=None) -> List[Tuple[str, str]]:
+    args = ["config", "-z"]
+    if file:
+        if not os.path.exists(os.path.join(repo.top, file)):
+            return []
+        args += ["--file", file]
+    args += ["--get-regexp", r"^slice\."]
+    rc, out, err = repo.try_run(*args)
+    if rc == 1:
+        return []
+    if rc != 0:
+        raise SliceError(err.strip())
+    entries = []
+    for item in out.split("\0"):
+        if not item:
+            continue
+        key, _, value = item.partition("\n")
+        entries.append((key, value))
+    return entries
+
+
+def load_slices(repo) -> Dict[str, Slice]:
+    slices: Dict[str, Slice] = {}
+    for where, file in (("shared", SHARED_FILE), ("local", None)):
+        for key, value in _config_entries(repo, file):
+            body = key[len("slice."):]
+            name, _, field_ = body.rpartition(".")
+            if not name or not field_:
+                continue
+            sl = slices.setdefault(name, Slice(name=name))
+            if where not in sl.where:
+                sl.where.append(where)
+            if field_ == "path":
+                if value not in sl.paths:
+                    sl.paths.append(value)
+            elif field_ == "base":
+                sl.base = value
+            elif field_ == "select":
+                if value not in SELECTS:
+                    raise SliceError("slice.%s.select must be one of %s" % (name, ", ".join(SELECTS)))
+                sl.select = value
+            elif field_ == "subject":
+                sl.subject = value
+    return slices
+
+
+def default_base(repo) -> str:
+    rc, out, _ = repo.try_run("symbolic-ref", "-q", "refs/remotes/origin/HEAD")
+    if rc == 0:
+        return out.strip().replace("refs/remotes/", "", 1)
+    for cand in ("main", "master"):
+        if repo.rev(cand):
+            return cand
+    raise SliceError("cannot guess a base branch; set one with --base")
+
+
+def get_slice(repo, name) -> Slice:
+    slices = load_slices(repo)
+    if name not in slices:
+        raise SliceError("no slice named '%s' (see `git slice list`)" % name)
+    sl = slices[name]
+    if not sl.paths:
+        raise SliceError("slice '%s' has no paths" % name)
+    if not sl.base:
+        sl.base = default_base(repo)
+    return sl
+
+
+def normalise_path(p: str) -> str:
+    prefix = os.environ.get("GIT_PREFIX", "")
+    if prefix and not p.startswith(":"):
+        p = os.path.normpath(os.path.join(prefix, p))
+    return p
+
+
+def state_refs(name, frm) -> Tuple[str, str]:
+    root = "%s/%s/%s" % (REF_ROOT, name, frm)
+    return root + "/source", root + "/landed"
+
+
+def branch_name(name, frm) -> str:
+    return "%s/%s/%s" % (BRANCH_ROOT, name, frm)
+
+
+def escape(s: str) -> str:
+    return s.replace("%", "%25").replace("/", "%2F")
+
+
+def worktree_path(repo, name, frm) -> str:
+    return os.path.join(repo.common, "slice", "wt", escape(name), escape(frm))
+
+
+def state_path(repo, name, frm) -> str:
+    return os.path.join(repo.common, "slice", "state", escape(name), escape(frm) + ".json")
+
+
+# ----------------------------------------------------------------- analysis
+
+@dataclass
+class Candidate:
+    sha: str
+    subject: str
+    pure: bool
+    marked: bool
+    decision: str = "replay"
+
+
+@dataclass
+class Analysis:
+    sl: Slice
+    frm: str
+    frm_sha: str
+    base: str
+    base_sha: str
+    branch: str
+    branch_sha: Optional[str]
+    source_prev: Optional[str]
+    old_landed: Optional[str]
+    new_landed: Optional[str]
+    landed_how: Optional[str]
+    warnings: List[str]
+    candidates: List[Candidate]
+
+    def to_replay(self) -> List[Candidate]:
+        return [c for c in self.candidates if c.decision == "replay"]
+
+
+def _describe(repo, shas: List[str], sl: Slice) -> List[Candidate]:
+    if not shas:
+        return []
+    stdin = "\n".join(shas) + "\n"
+    fmt = "%H%x1f%s%x1f%(trailers:key=" + MARK_TRAILER + ",valueonly,separator=%x2c)"
+    meta = {}
+    for line in repo.run("log", "--no-walk=unsorted", "--stdin", "--format=" + fmt, input=stdin).splitlines():
+        parts = line.split("\x1f")
+        if len(parts) >= 2:
+            meta[parts[0]] = (parts[1], parts[2] if len(parts) > 2 else "")
+
+    def files(pathspec):
+        out = repo.run("log", "--no-walk=unsorted", "--stdin", "--format=%x00%H", "--name-only",
+                       *pathspec, input=stdin)
+        res = {}
+        for chunk in out.split("\0"):
+            lines = [l for l in chunk.splitlines() if l.strip()]
+            if lines:
+                res[lines[0]] = set(lines[1:])
+        return res
+
+    all_files = files([])
+    in_files = files(["--", *sl.paths])
+    rx = re.compile(sl.subject) if sl.subject else None
+    cands = []
+    for sha in shas:
+        subject, marks = meta.get(sha, ("", ""))
+        pure = all_files.get(sha, set()) == in_files.get(sha, set())
+        marked = any(m.strip().lower() == sl.name.lower() for m in marks.split(",") if m.strip())
+        if rx and rx.search(subject):
+            marked = True
+        cands.append(Candidate(sha, subject, pure, marked))
+    return cands
+
+
+def _patch_ids(repo, revs: List[str], paths: List[str], stdin: Optional[str] = None) -> Dict[str, str]:
+    """Map commit -> stable patch id of its diff restricted to paths."""
+    args = ["log", "-p", "--no-merges", "--no-color", "--no-renames",
+            "--format=commit %H", *revs, "--", *paths]
+    rc, out, err = repo.try_run(*args, input=stdin, binary=True)
+    if rc != 0:
+        raise SliceError(err.strip())
+    if not out:
+        return {}
+    rc, ids, err = repo.try_run("patch-id", "--stable", input=out)
+    res = {}
+    for line in ids.splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            res[parts[1]] = parts[0]
+    return res
+
+
+def _sliced_from(repo, base_sha, scan_from) -> set:
+    out = repo.run("log", "--format=%(trailers:key=" + TRAILER + ",valueonly,separator=%x2c)",
+                   base_sha, "^" + scan_from)
+    found = set()
+    for line in out.splitlines():
+        for v in line.split(","):
+            v = v.strip()
+            if v:
+                found.add(v)
+    return found
+
+
+def _content_landed(repo, branch_sha, base_sha, source_prev, paths) -> bool:
+    shas = repo.run("rev-list", base_sha, "^" + source_prev, "--", *paths).split()
+    for s in shas:
+        rc, _, _ = repo.try_run("diff", "--quiet", s, branch_sha, "--", *paths)
+        if rc == 0:
+            return True
+    return False
+
+
+def analyse(repo, sl: Slice, frm: str, base: Optional[str] = None, all_: bool = False,
+            branch: Optional[str] = None) -> Analysis:
+    base = base or sl.base
+    base_sha = repo.rev(base)
+    if not base_sha:
+        raise SliceError("base '%s' is not a commit" % base)
+    frm_sha = repo.rev(frm)
+    if not frm_sha:
+        raise SliceError("'%s' is not a commit" % frm)
+    if frm_sha == base_sha:
+        raise SliceError("'%s' and base '%s' are the same commit" % (frm, base))
+    branch = branch or branch_name(sl.name, frm)
+    repo.check_ref_format(branch)
+    branch_sha = repo.rev("refs/heads/" + branch)
+    source_ref, landed_ref = state_refs(sl.name, frm)
+    source_prev = repo.rev(source_ref)
+    old_landed = repo.rev(landed_ref)
+    warnings: List[str] = []
+
+    new_landed = old_landed
+    if old_landed and not repo.is_ancestor(old_landed, frm_sha):
+        warnings.append("%s was rewritten since the last update; the recorded landed point is ignored "
+                        "and patch ids are relied on instead" % frm)
+        new_landed = None
+
+    landed_how = None
+    if branch_sha and source_prev:
+        if repo.is_ancestor(branch_sha, base_sha):
+            landed_how = "merged"
+        elif _content_landed(repo, branch_sha, base_sha, source_prev, sl.paths):
+            landed_how = "content"
+        if landed_how and repo.is_ancestor(source_prev, frm_sha):
+            if new_landed is None or repo.is_ancestor(new_landed, source_prev):
+                new_landed = source_prev
+
+    revs = ["rev-list", "--reverse", "--no-merges", frm_sha, "^" + base_sha]
+    if new_landed:
+        revs.append("^" + new_landed)
+    shas = repo.run(*revs, "--", *sl.paths).split()
+    cands = _describe(repo, shas, sl)
+
+    if cands:
+        scan_from = source_prev if (source_prev and repo.is_ancestor(source_prev, frm_sha)) else frm_sha
+        trailers = _sliced_from(repo, base_sha, scan_from)
+        base_ids = set(_patch_ids(repo, [base_sha, "^" + scan_from], sl.paths).values())
+        cand_ids = _patch_ids(repo, ["--no-walk=unsorted", "--stdin"], sl.paths,
+                              stdin="\n".join(shas) + "\n")
+        for c in cands:
+            if c.sha in trailers:
+                c.decision = "landed (trailer)"
+            elif cand_ids.get(c.sha) and cand_ids[c.sha] in base_ids:
+                c.decision = "landed (patch-id)"
+            elif not all_ and sl.select == "pure" and not c.pure:
+                c.decision = "skip (mixed)"
+            elif not all_ and sl.select == "marked" and not c.marked:
+                c.decision = "skip (unmarked)"
+        for c in cands:
+            if c.decision.startswith("landed"):
+                new_landed = c.sha
+            else:
+                break
+
+    return Analysis(sl, frm, frm_sha, base, base_sha, branch, branch_sha, source_prev,
+                    old_landed, new_landed, landed_how, warnings, cands)
+
+
+# -------------------------------------------------------------------- build
+
+def _save_state(repo, st):
+    path = state_path(repo, st["name"], st["frm"])
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f, indent=1)
+    os.replace(tmp, path)
+
+
+def _load_state(repo, name, frm) -> Optional[dict]:
+    path = state_path(repo, name, frm)
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def _drop_state(repo, name, frm):
+    path = state_path(repo, name, frm)
+    if os.path.exists(path):
+        os.remove(path)
+
+
+def _remove_worktree(repo, wt):
+    if repo.worktree_registered(wt):
+        repo.try_run("worktree", "remove", "--force", wt)
+    if os.path.isdir(wt):
+        shutil.rmtree(wt, ignore_errors=True)
+    repo.try_run("worktree", "prune")
+
+
+def _prepare_worktree(repo, wt, base_sha, paths):
+    _remove_worktree(repo, wt)
+    os.makedirs(os.path.dirname(wt), exist_ok=True)
+    repo.run("worktree", "add", "--detach", "--no-checkout", wt, base_sha)
+    repo.run("read-tree", "HEAD", cwd=wt)
+    listed = repo.run("ls-files", "-z", "--", *paths, cwd=wt, binary=True)
+    if listed:
+        repo.run("checkout-index", "-z", "--stdin", cwd=wt, input=listed)
+
+
+def _wt_head(repo, wt) -> str:
+    return repo.run("rev-parse", "HEAD", cwd=wt).strip()
+
+
+def _am_in_progress(repo, wt) -> bool:
+    p = repo.run("rev-parse", "--git-path", "rebase-apply", cwd=wt).strip()
+    return os.path.isdir(os.path.join(wt, p) if not os.path.isabs(p) else p)
+
+
+def _make_patch(repo, sha, paths) -> bytes:
+    return repo.run("-c", "format.signoff=false", "-c", "diff.noprefix=false",
+                    "-c", "diff.mnemonicprefix=false", "-c", "format.useautobase=false",
+                    "format-patch", "-1", "-k", "--stdout", "--binary", "--full-index",
+                    "--no-signature", "--no-thread", "--no-cover-letter", "--no-notes",
+                    "--no-numbered", sha, "--", *paths, binary=True)
+
+
+def _committer_env(repo, src_sha) -> Dict[str, str]:
+    """Committer identity of the source commit.
+
+    Using it for the replayed commit makes a rebuild a pure function of
+    (base, source, paths): re-running update with nothing changed produces the
+    same commit ids, so there is no branch to force-push and no PR churn.
+    """
+    name, email, date = repo.run("log", "-1", "--format=%cn%x1f%ce%x1f%cI", src_sha).strip().split("\x1f")
+    return {"GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": email, "GIT_COMMITTER_DATE": date}
+
+
+def _add_trailer(repo, wt, src_sha):
+    msg = repo.run("log", "-1", "--format=%B", cwd=wt, binary=True)
+    msg = repo.run("interpret-trailers", "--if-exists", "addIfDifferent",
+                   "--trailer", "%s: %s" % (TRAILER, src_sha), cwd=wt, input=msg, binary=True)
+    repo.run("commit", "--amend", "--no-verify", "--cleanup=verbatim", "-F", "-", cwd=wt,
+             input=msg, env_extra=_committer_env(repo, src_sha))
+
+
+def _finish_current(repo, st):
+    wt = st["worktree"]
+    head = _wt_head(repo, wt)
+    cur = st["current"]
+    if head == st["head_before"]:
+        st["already"].append(cur)
+    else:
+        _add_trailer(repo, wt, cur)
+        st["replayed"].append([cur, _wt_head(repo, wt)])
+    st["current"] = None
+    st["head_before"] = None
+    _save_state(repo, st)
+
+
+def _run_queue(repo, st, quiet=False) -> bool:
+    wt = st["worktree"]
+    am = ["am", "-3", "-k"]
+    if repo.features()["am_no_verify"]:
+        am.append("--no-verify")
+    while st["queue"]:
+        st["current"] = st["queue"].pop(0)
+        st["head_before"] = _wt_head(repo, wt)
+        _save_state(repo, st)
+        patch = _make_patch(repo, st["current"], st["paths"])
+        if b"\ndiff --git " not in patch:
+            _finish_current(repo, st)
+            continue
+        rc, _, err = repo.try_run(*am, cwd=wt, input=patch)
+        if rc != 0:
+            _save_state(repo, st)
+            subject = repo.run("log", "-1", "--format=%s", st["current"]).strip()
+            sys.stderr.write(
+                "conflict while replaying %s %s\n"
+                "  resolve it in:  %s\n"
+                "  then run:       git slice continue %s --from %s\n"
+                "  or:             git slice skip %s --from %s   /   git slice abort %s --from %s\n"
+                % (short(st["current"]), subject, wt, st["name"], st["frm"],
+                   st["name"], st["frm"], st["name"], st["frm"]))
+            return False
+        _finish_current(repo, st)
+    _finalize(repo, st, quiet)
+    return True
+
+
+def _finalize(repo, st, quiet=False):
+    wt = st.get("worktree")
+    new_sha = st.get("keep_sha") or (_wt_head(repo, wt) if wt else st["base_sha"])
+    _set_branch(repo, st["branch"], new_sha)
+    source_ref, landed_ref = state_refs(st["name"], st["frm"])
+    repo.update_ref(source_ref, st["frm_sha"])
+    if st.get("new_landed"):
+        repo.update_ref(landed_ref, st["new_landed"])
+    if wt:
+        _remove_worktree(repo, wt)
+    _drop_state(repo, st["name"], st["frm"])
+    if not quiet and st.get("keep_sha"):
+        n = repo.run("rev-list", "--count", new_sha, "^" + repo.run(
+            "merge-base", st["base_sha"], new_sha).strip()).strip()
+        print("%s: unchanged, %s commit%s (%s has moved on but the slice has not; "
+              "--force-rebuild to rebase it)" % (st["branch"], n, "" if n == "1" else "s", st["base"]))
+    elif not quiet:
+        n = len(st["replayed"])
+        ahead = repo.run("rev-list", "--count", st["base_sha"] + ".." + new_sha).strip()
+        extra = []
+        if st["already"]:
+            extra.append("%d already in %s" % (len(st["already"]), st["base"]))
+        if st.get("skipped"):
+            extra.append("%d skipped" % st["skipped"])
+        print("%s: %s + %s commit%s (%d replayed%s)" % (
+            st["branch"], st["base"], ahead, "" if ahead == "1" else "s", n,
+            ", " + ", ".join(extra) if extra else ""))
+        for src, new in st["replayed"]:
+            print("  %s  %s" % (short(new), repo.run("log", "-1", "--format=%s", new).strip()))
+    if not quiet and st.get("conflicts_with_base"):
+        sys.stderr.write("warning: %s no longer applies cleanly to %s; run --force-rebuild "
+                         "to rebase it and resolve the conflict\n" % (st["branch"], st["base"]))
+    if st.get("push"):
+        _push(repo, st["push"], st["branch"], quiet)
+
+
+def _set_branch(repo, branch, sha):
+    at = repo.branch_checked_out_at(branch)
+    if at:
+        raise SliceError("branch %s is checked out at %s; detach it first" % (branch, at))
+    repo.run("branch", "-f", branch, sha)
+
+
+def _push(repo, remote, branch, quiet=False):
+    ref = "refs/heads/%s" % branch
+    local = repo.rev(ref)
+    rc, out, _ = repo.try_run("ls-remote", remote, ref)
+    if rc == 0 and out.split() and out.split()[0] == local:
+        if not quiet:
+            print("%s is already up to date on %s" % (branch, remote))
+        return
+    rc, out, err = repo.try_run("push", "--force", remote, "%s:%s" % (ref, ref))
+    if rc != 0:
+        raise SliceError("push failed:\n" + err.strip())
+    if not quiet:
+        print("pushed %s to %s" % (branch, remote))
+
+
+def _branch_encodes(repo, an: Analysis, to_replay) -> bool:
+    """True if the existing derived branch already holds exactly these commits.
+
+    When base moves but the slice's own commits do not, rebuilding would change
+    every commit id and force-push, which marks a pull request's review comments
+    outdated for no reason.  A branch that already encodes the right commits is
+    left exactly as it is.
+    """
+    if not an.branch_sha or not to_replay:
+        return False
+    mb = repo.run("merge-base", an.base_sha, an.branch_sha).strip()
+    out = repo.run("log", "--reverse", "--format=%(trailers:key=" + TRAILER + ",valueonly,separator=%x2c)",
+                   an.branch_sha, "^" + mb)
+    return [l.strip() for l in out.splitlines()] == [c.sha for c in to_replay]
+
+
+def _conflicts_with_base(repo, an: Analysis) -> bool:
+    if not repo.features()["merge_tree_write"]:
+        return False
+    rc, _, _ = repo.try_run("merge-tree", "--write-tree", an.base_sha, an.branch_sha)
+    return rc == 1
+
+
+def do_update(repo, sl, an: Analysis, push: Optional[str], quiet: bool, force_rebuild: bool = False) -> bool:
+    if _load_state(repo, sl.name, an.frm):
+        raise SliceError("an update of slice '%s' from %s is in progress; run `git slice continue` "
+                         "or `git slice abort`" % (sl.name, an.frm))
+    at = repo.branch_checked_out_at(an.branch)
+    if at:
+        raise SliceError("branch %s is checked out at %s; detach it first" % (an.branch, at))
+    for w in an.warnings:
+        sys.stderr.write("warning: %s\n" % w)
+    to_replay = an.to_replay()
+    st = {
+        "name": sl.name, "frm": an.frm, "frm_sha": an.frm_sha, "base": an.base, "base_sha": an.base_sha,
+        "branch": an.branch, "paths": sl.paths, "worktree": None,
+        "queue": [c.sha for c in to_replay], "current": None, "head_before": None,
+        "replayed": [], "already": [c.sha for c in an.candidates if c.decision.startswith("landed")],
+        "skipped": sum(1 for c in an.candidates if c.decision.startswith("skip")),
+        "new_landed": an.new_landed, "push": push,
+    }
+    if not force_rebuild and _branch_encodes(repo, an, to_replay):
+        st["keep_sha"] = an.branch_sha
+        st["conflicts_with_base"] = _conflicts_with_base(repo, an)
+        _finalize(repo, st, quiet)
+        return True
+    if not to_replay:
+        _finalize(repo, st, quiet)
+        return True
+    wt = worktree_path(repo, sl.name, an.frm)
+    _prepare_worktree(repo, wt, an.base_sha, sl.paths)
+    st["worktree"] = wt
+    _save_state(repo, st)
+    return _run_queue(repo, st, quiet)
+
+
+# ----------------------------------------------------------------- commands
+
+def resolve_from(repo, frm: Optional[str]) -> str:
+    if frm:
+        return frm
+    cur = repo.current_branch()
+    if not cur:
+        raise SliceError("HEAD is detached; say which branch to slice with --from")
+    return cur
+
+
+def cmd_add(repo, a):
+    if not a.paths:
+        raise SliceError("give at least one path")
+    if a.select not in SELECTS:
+        raise SliceError("--select must be one of " + ", ".join(SELECTS))
+    existing = load_slices(repo).get(a.name)
+    target = ["--file", SHARED_FILE] if a.shared else ["--local"]
+    where = "shared" if a.shared else "local"
+    if existing and where in existing.where:
+        raise SliceError("slice '%s' is already defined (%s); remove it first with `git slice rm`" % (a.name, where))
+    key = "slice.%s." % a.name
+    for p in a.paths:
+        repo.run("config", *target, "--add", key + "path", normalise_path(p))
+    if a.base:
+        repo.run("config", *target, key + "base", a.base)
+    if a.select != "all":
+        repo.run("config", *target, key + "select", a.select)
+    if a.subject:
+        repo.run("config", *target, key + "subject", a.subject)
+    sl = get_slice(repo, a.name)
+    print("slice %s: %s onto %s (%s)%s" % (a.name, " ".join(sl.paths), sl.base, where,
+                                            "" if sl.select == "all" else ", select=" + sl.select))
+    if a.shared and repo.run("status", "--porcelain", "--", SHARED_FILE).strip():
+        print("note: %s is not committed yet; commit it so the definition travels with the repository"
+              % SHARED_FILE)
+
+
+def cmd_rm(repo, a):
+    sl = load_slices(repo).get(a.name)
+    if not sl:
+        raise SliceError("no slice named '%s'" % a.name)
+    where = "shared" if a.shared else "local"
+    if where not in sl.where:
+        raise SliceError("slice '%s' has no %s definition (defined: %s)" % (a.name, where, ", ".join(sl.where)))
+    target = ["--file", SHARED_FILE] if a.shared else ["--local"]
+    repo.run("config", *target, "--remove-section", "slice." + a.name)
+    print("removed the %s definition of slice %s" % (where, a.name))
+
+
+def cmd_list(repo, a):
+    slices = load_slices(repo)
+    if not slices:
+        print("no slices defined (add one with `git slice add <name> <path>...`)")
+        return
+    for sl in slices.values():
+        base = sl.base or default_base(repo) + " (default)"
+        extra = "" if sl.select == "all" else "  select=" + sl.select
+        if sl.subject:
+            extra += "  subject=/%s/" % sl.subject
+        print("%-12s %-14s %s  [%s]%s" % (sl.name, base, " ".join(sl.paths), ",".join(sl.where), extra))
+
+
+def _print_analysis(repo, an: Analysis, verbose=True):
+    print("slice %s: %s -> %s  (branch %s)" % (an.sl.name, an.frm, an.base, an.branch))
+    if an.branch_sha:
+        ahead = repo.run("rev-list", "--count", an.base_sha + ".." + an.branch_sha).strip()
+        stale = "" if an.source_prev == an.frm_sha else ", built from an older %s" % an.frm
+        merged = ", merged into %s" % an.base if an.landed_how == "merged" else ""
+        print("  branch: %s ahead of %s%s%s" % (ahead, an.base, stale, merged))
+    else:
+        print("  branch: not built yet")
+    if an.new_landed:
+        print("  landed up to: %s%s" % (short(an.new_landed),
+                                        "" if an.new_landed == an.old_landed else " (advanced by this run)"))
+    for w in an.warnings:
+        print("  warning: %s" % w)
+    n = len(an.to_replay())
+    print("  pending: %d commit%s to replay" % (n, "" if n == 1 else "s"))
+    if verbose:
+        for c in an.candidates:
+            tag = ""
+            if not c.pure:
+                tag += " [mixed]"
+            if c.marked:
+                tag += " [marked]"
+            print("  %-18s %s %s%s" % (c.decision, short(c.sha), c.subject, tag))
+
+
+def cmd_log(repo, a):
+    sl = get_slice(repo, a.name)
+    frm = resolve_from(repo, a.frm)
+    an = analyse(repo, sl, frm, a.onto, a.all, a.branch)
+    _print_analysis(repo, an, verbose=True)
+
+
+def cmd_status(repo, a):
+    slices = load_slices(repo)
+    names = [a.name] if a.name else list(slices)
+    if not names:
+        print("no slices defined")
+        return
+    frm = resolve_from(repo, a.frm)
+    for name in names:
+        sl = get_slice(repo, name)
+        try:
+            an = analyse(repo, sl, frm, a.onto, a.all)
+        except SliceError as e:
+            print("slice %s: %s" % (name, e))
+            continue
+        _print_analysis(repo, an, verbose=False)
+
+
+def cmd_update(repo, a):
+    sl = get_slice(repo, a.name)
+    frm = resolve_from(repo, a.frm)
+    an = analyse(repo, sl, frm, a.onto, a.all, a.branch)
+    ok = do_update(repo, sl, an, a.push, a.quiet, a.force_rebuild)
+    return 0 if ok else 1
+
+
+def _resume(repo, a, mode) -> int:
+    frm = resolve_from(repo, a.frm)
+    st = _load_state(repo, a.name, frm)
+    if not st:
+        raise SliceError("no update of slice '%s' from %s is in progress" % (a.name, frm))
+    wt = st["worktree"]
+    if mode == "abort":
+        if wt and _am_in_progress(repo, wt):
+            repo.try_run("am", "--abort", cwd=wt)
+        if wt:
+            _remove_worktree(repo, wt)
+        _drop_state(repo, a.name, frm)
+        print("aborted; %s left untouched" % st["branch"])
+        return 0
+    if st["current"]:
+        if mode == "skip":
+            if _am_in_progress(repo, wt):
+                repo.try_run("am", "--skip", cwd=wt)
+            st["skipped"] = st.get("skipped", 0) + 1
+            st["current"] = None
+            _save_state(repo, st)
+        else:
+            if _am_in_progress(repo, wt):
+                rc, out, err = repo.try_run("am", "--continue", cwd=wt)
+                if rc != 0:
+                    sys.stderr.write(err.strip() + "\n")
+                    sys.stderr.write("resolve the conflict in %s (git add the files), then run "
+                                     "git slice continue again\n" % wt)
+                    return 1
+            _finish_current(repo, st)
+    return 0 if _run_queue(repo, st, a.quiet) else 1
+
+
+def cmd_continue(repo, a):
+    return _resume(repo, a, "continue")
+
+
+def cmd_skip(repo, a):
+    return _resume(repo, a, "skip")
+
+
+def cmd_abort(repo, a):
+    return _resume(repo, a, "abort")
+
+
+def cmd_forget(repo, a):
+    frm = resolve_from(repo, a.frm)
+    for ref in state_refs(a.name, frm):
+        repo.delete_ref(ref)
+    if a.branch:
+        br = branch_name(a.name, frm)
+        if repo.rev("refs/heads/" + br):
+            repo.run("branch", "-D", br)
+    print("forgot the sync state of slice %s from %s" % (a.name, frm))
+
+
+def cmd_landed(repo, a):
+    frm = resolve_from(repo, a.frm)
+    sha = repo.rev(a.rev)
+    if not sha:
+        raise SliceError("'%s' is not a commit" % a.rev)
+    if not repo.is_ancestor(sha, frm):
+        raise SliceError("%s is not an ancestor of %s" % (a.rev, frm))
+    _, landed_ref = state_refs(a.name, frm)
+    repo.update_ref(landed_ref, sha)
+    print("slice %s from %s: everything up to %s is now treated as landed" % (a.name, frm, short(sha)))
+
+
+def cmd_pr(repo, a):
+    sl = get_slice(repo, a.name)
+    frm = resolve_from(repo, a.frm)
+    if not shutil.which("gh"):
+        raise SliceError("`gh` (GitHub CLI) is not installed")
+    an = analyse(repo, sl, frm, a.onto, a.all)
+    if not a.no_update:
+        if not do_update(repo, sl, an, None, a.quiet, a.force_rebuild):
+            return 1
+        an = analyse(repo, sl, frm, a.onto, a.all)
+    if not an.branch_sha or not repo.rev("refs/heads/" + an.branch):
+        raise SliceError("branch %s does not exist" % an.branch)
+    _push(repo, a.remote, an.branch, a.quiet)
+    base = an.base.split("/", 1)[1] if an.base.startswith(a.remote + "/") else an.base
+    p = subprocess.run(["gh", "pr", "list", "--head", an.branch, "--base", base, "--state", "open",
+                        "--json", "url", "--jq", ".[0].url"], cwd=repo.top, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, text=True)
+    url = p.stdout.strip()
+    if url:
+        print("existing PR updated: %s" % url)
+        return 0
+    body_lines = ["Slice `%s` (%s) from `%s`, rebuilt by `git slice`." % (sl.name, " ".join(sl.paths), frm), ""]
+    for line in repo.run("log", "--reverse", "--format=- %s (%h)", an.base + ".." + an.branch).splitlines():
+        body_lines.append(line)
+    title = a.title or "%s: %s" % (sl.name, frm)
+    cmd = ["gh", "pr", "create", "--base", base, "--head", an.branch, "--title", title,
+           "--body", "\n".join(body_lines)]
+    if a.draft:
+        cmd.append("--draft")
+    p = subprocess.run(cmd, cwd=repo.top)
+    return p.returncode
+
+
+# --------------------------------------------------------------------- main
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="git slice", description=__doc__.split("\n\n")[0])
+    p.add_argument("--version", action="version", version="git-slice " + VERSION)
+    sub = p.add_subparsers(dest="cmd", metavar="<command>")
+
+    def common(sp, frm=True, onto=True, all_=True, branch=False, quiet=False):
+        if frm:
+            sp.add_argument("--from", dest="frm", metavar="BRANCH",
+                            help="source branch (default: the current branch)")
+        if onto:
+            sp.add_argument("--onto", metavar="BASE", help="override the slice's base for this run")
+        if all_:
+            sp.add_argument("--all", action="store_true",
+                            help="ignore the slice's selection rule (pure/marked) for this run")
+        if branch:
+            sp.add_argument("--branch", metavar="NAME",
+                            help="name of the derived branch (default: slice/<name>/<from>)")
+        if quiet:
+            sp.add_argument("-q", "--quiet", action="store_true")
+
+    sp = sub.add_parser("add", help="define a slice")
+    sp.add_argument("name")
+    sp.add_argument("paths", nargs="*", metavar="path", help="paths or pathspecs that make up the slice")
+    sp.add_argument("--base", metavar="BRANCH", help="branch the slice lands on (default: origin/HEAD, main or master)")
+    sp.add_argument("--select", default="all", metavar="RULE",
+                    help="all: every commit touching the paths (restricted to them); "
+                         "pure: only commits that touch nothing else; "
+                         "marked: only commits with a 'Slice: <name>' trailer or a matching --subject")
+    sp.add_argument("--subject", metavar="REGEX", help="with --select marked: subjects matching this count as marked")
+    sp.add_argument("--shared", action="store_true", help="write to %s (committed) instead of .git/config" % SHARED_FILE)
+    sp.set_defaults(func=cmd_add)
+
+    sp = sub.add_parser("rm", help="remove a slice definition")
+    sp.add_argument("name")
+    sp.add_argument("--shared", action="store_true",
+                    help="remove the definition in %s instead of the local one" % SHARED_FILE)
+    sp.set_defaults(func=cmd_rm)
+
+    sp = sub.add_parser("list", help="list slices")
+    sp.set_defaults(func=cmd_list)
+
+    sp = sub.add_parser("log", help="show what an update would do, commit by commit")
+    sp.add_argument("name")
+    common(sp, branch=True)
+    sp.set_defaults(func=cmd_log)
+
+    sp = sub.add_parser("status", help="summary of each slice for the current branch")
+    sp.add_argument("name", nargs="?")
+    common(sp)
+    sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser("update", help="rebuild the derived branch")
+    sp.add_argument("name")
+    common(sp, branch=True, quiet=True)
+    sp.add_argument("--push", nargs="?", const="origin", metavar="REMOTE",
+                    help="force-push the derived branch afterwards (default remote: origin)")
+    sp.add_argument("--force-rebuild", action="store_true",
+                    help="rebuild onto the current base even if the branch already holds the right "
+                         "commits (changes commit ids, so an open PR is force-pushed)")
+    sp.set_defaults(func=cmd_update)
+
+    for name, fn, hlp in (("continue", cmd_continue, "resume an update after resolving a conflict"),
+                          ("skip", cmd_skip, "drop the conflicting commit and resume"),
+                          ("abort", cmd_abort, "abandon an update in progress")):
+        sp = sub.add_parser(name, help=hlp)
+        sp.add_argument("name")
+        common(sp, onto=False, all_=False, quiet=True)
+        sp.set_defaults(func=fn)
+
+    sp = sub.add_parser("forget", help="drop the recorded sync state for a source branch")
+    sp.add_argument("name")
+    common(sp, onto=False, all_=False)
+    sp.add_argument("--branch", action="store_true", help="also delete the derived branch")
+    sp.set_defaults(func=cmd_forget)
+
+    sp = sub.add_parser("landed", help="declare that everything up to a commit is already in base")
+    sp.add_argument("name")
+    sp.add_argument("rev")
+    common(sp, onto=False, all_=False)
+    sp.set_defaults(func=cmd_landed)
+
+    sp = sub.add_parser("pr", help="update, push and open (or refresh) a pull request with gh")
+    sp.add_argument("name")
+    common(sp, quiet=True)
+    sp.add_argument("--remote", default="origin")
+    sp.add_argument("--title")
+    sp.add_argument("--draft", action="store_true")
+    sp.add_argument("--no-update", action="store_true", help="push the branch as it is")
+    sp.add_argument("--force-rebuild", action="store_true", help="see `git slice update --force-rebuild`")
+    sp.set_defaults(func=cmd_pr)
+    return p
+
+
+def main(argv=None):
+    parser = build_parser()
+    a = parser.parse_args(argv)
+    if not a.cmd:
+        parser.print_help()
+        return 2
+    try:
+        repo = Repo()
+        rc = a.func(repo, a)
+        return rc or 0
+    except SliceError as e:
+        sys.stderr.write("fatal: %s\n" % e)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
