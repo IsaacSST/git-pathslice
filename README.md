@@ -19,7 +19,7 @@ Needs git 2.22 or newer and Python 3.
 
 ```bash
 ln -s "$PWD/git-slice" ~/.local/bin/git-slice   # any directory on PATH
-git slice --help
+git slice -h        # `git slice --help` looks for a man page, as git does for any subcommand
 ```
 
 ## Quick start
@@ -137,7 +137,7 @@ git slice update <name> [--from B] [--onto B] [--all] [--branch NAME] [--push [R
 git slice continue|skip|abort <name> [--from B]
 git slice forget <name> [--from B] [--branch]               drop the sync refs (and branch)
 git slice landed <name> <rev> [--from B]
-git slice pr <name> [--remote R] [--title T] [--draft] [--no-update]
+git slice pr <name> [--remote R] [--title T] [--draft] [--no-update] [--force-rebuild]
 ```
 
 `--from` defaults to the current branch. `--base` defaults to `origin/HEAD`,
