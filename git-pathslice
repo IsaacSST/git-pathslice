@@ -376,8 +376,6 @@ def analyse(repo, sl: Slice, frm: str, base: Optional[str] = None, all_: bool = 
     base_sha, frm_sha = repo.rev(base), repo.rev(frm)
     if not base_sha or not frm_sha:
         raise SliceError("source and base must both name commits")
-    if frm_sha == base_sha:
-        raise SliceError("'%s' and base '%s' are the same commit" % (frm, base))
     branch = branch or branch_name(sl.name, frm)
     repo.check_ref_format(branch)
     branch_sha = repo.rev("refs/heads/" + branch)

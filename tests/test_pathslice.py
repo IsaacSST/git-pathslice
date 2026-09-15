@@ -172,12 +172,14 @@ class TestUpdate(Base):
 
     def test_nothing_pending(self):
         self.git("switch", "-q", "-c", "dev")
-        self.commit("code only", {"src/a.py": "x=2\n"})
-        self.git("switch", "-q", "main")
         self.slice("add", "docs", "docs/", "--base", "main")
-        out = self.slice("update", "docs", "--from", "dev").stdout
-        self.assertIn("main + 0 commits", out)
-        self.assertEqual(self.sha("pathslice/docs/dev"), self.sha("main"))
+        for code in (None, "x=2\n"):
+            with self.subTest(code=code):
+                if code:
+                    self.commit("code only", {"src/a.py": code})
+                out = self.slice("update", "docs").stdout
+                self.assertIn("main + 0 commits", out)
+                self.assertEqual(self.sha("pathslice/docs/dev"), self.sha("main"))
 
     def test_run_from_subdirectory(self):
         self.standard_dev()
