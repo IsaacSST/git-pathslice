@@ -99,7 +99,8 @@ class Base(unittest.TestCase):
         return bare
 
     def worktrees(self):
-        return [l for l in self.git("worktree", "list", "--porcelain").splitlines() if l.startswith("worktree ")]
+        return [line for line in self.git("worktree", "list", "--porcelain").splitlines()
+                if line.startswith("worktree ")]
 
     def standard_dev(self):
         """dev: docs-only, mixed (+feature, -old, index edit, code), code-only.  main: own docs change."""
