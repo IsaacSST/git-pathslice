@@ -146,7 +146,7 @@ class TestUpdate(Base):
         self.slice("forget", "docs", "--from", "dev")
         self.env.update({"GIT_COMMITTER_NAME": "CI", "GIT_COMMITTER_EMAIL": "ci@example.com",
                          "GIT_AUTHOR_NAME": "CI", "GIT_AUTHOR_EMAIL": "ci@example.com"})
-        self.slice("update", "docs", "--from", "dev")
+        self.slice("update", "docs", "--from", "dev", "--branch", "pathslice/docs/dev")
         self.assertEqual(self.sha("pathslice/docs/dev"), first)
 
     def test_nothing_pending(self):
@@ -204,6 +204,52 @@ class TestUpdate(Base):
 
 
 class TestBranchProtection(Base):
+    def test_rebase_and_bisect_in_a_linked_worktree_are_protected(self):
+        self.standard_dev()
+        branch = "pathslice/docs/dev"
+        self.slice("update", "docs", "--from", "dev")
+        head = self.sha(branch)
+        self.git("switch", "-q", "-c", "competing", "main")
+        self.commit("Competing intro", {"docs/index.md": "competing\n"})
+        self.git("switch", "-q", "dev")
+        self.commit("Later documentation", {"docs/later.md": "later\n"})
+        self.git("switch", "-q", "main")
+        wt = os.path.join(self.tmp, "review")
+        self.git("worktree", "add", "-q", wt, branch)
+        p = subprocess.run(["git", "rebase", "competing"], cwd=wt, env=self.env, capture_output=True)
+        self.assertNotEqual(p.returncode, 0)
+        for operation in ("rebase", "bisect"):
+            with self.subTest(operation=operation):
+                for command in (("update",), ("forget", "--branch")):
+                    p = self.slice(*command, "docs", "--from", "dev", check=False)
+                    self.assertNotEqual(p.returncode, 0)
+                    self.assertIn("in use", p.stderr)
+                    self.assertEqual(self.sha(branch), head)
+                if operation == "rebase":
+                    self.git("rebase", "--abort", cwd=wt)
+                    self.git("bisect", "start", branch, "main", cwd=wt)
+                else:
+                    self.git("bisect", "reset", cwd=wt)
+
+    def test_symbolic_export_does_not_change_its_target(self):
+        self.standard_dev()
+        branch = "pathslice/docs/dev"
+        self.slice("update", "docs", "--from", "dev")
+        head = self.sha(branch)
+        self.git("branch", "independent", branch)
+        self.git("branch", "-D", branch)
+        self.git("symbolic-ref", "refs/heads/" + branch, "refs/heads/independent")
+        self.git("switch", "-q", "dev")
+        self.commit("Later documentation", {"docs/later.md": "later\n"})
+        self.git("switch", "-q", "main")
+        for command in (("update",), ("forget", "--branch"), ("adopt",)):
+            with self.subTest(command=command):
+                p = self.slice(*command, "docs", "--from", "dev", check=False)
+                self.assertNotEqual(p.returncode, 0)
+                self.assertIn("symbolic reference", p.stderr)
+                self.assertEqual(self.sha("independent"), head)
+                self.assertEqual(self.git("symbolic-ref", "refs/heads/" + branch).strip(), "refs/heads/independent")
+
     def test_unrecorded_branches_are_preserved(self):
         self.standard_dev()
         for branch in ("pathslice/docs/dev", "review/docs"):
@@ -298,6 +344,68 @@ class TestBranchProtection(Base):
         self.slice("forget", "docs", "--from", "dev")
         self.slice("update", "docs", "--from", "dev")
         self.assertEqual(self.sha("pathslice/docs/dev"), head)
+
+
+class TestAdoption(Base):
+    def test_clone_can_adopt_an_export_without_rewriting_it(self):
+        self.standard_dev()
+        self.git("switch", "-q", "dev")
+        binary = b"\x00\x01\xff\xfe"
+        self.commit("Binary documentation", {"docs/image.bin": binary})
+        self.git("switch", "-q", "main")
+        bare = self.remote()
+        branch = "pathslice/docs/dev"
+        self.slice("update", "docs", "--from", "dev", "--push")
+        head = self.sha(branch)
+        other = os.path.join(self.tmp, "clone")
+        self.git("clone", "-q", bare, other)
+        self.git("branch", "dev", "origin/dev", cwd=other)
+        self.git("branch", branch, "origin/" + branch, cwd=other)
+        self.slice("add", "docs", "docs/", "--base", "main", cwd=other)
+        self.slice("adopt", "docs", "--from", "dev", cwd=other)
+        self.slice("update", "docs", "--from", "dev", "--push", cwd=other)
+        self.assertEqual(self.git("rev-parse", branch, cwd=other).strip(), head)
+        self.assertEqual(self.git("show", branch + ":docs/image.bin", cwd=other, binary=True), binary)
+
+    def test_renamed_export_and_source_can_be_reconnected(self):
+        self.standard_dev()
+        self.slice("update", "docs", "--from", "dev")
+        self.git("branch", "-m", "pathslice/docs/dev", "review/docs")
+        p = self.slice("update", "docs", "--from", "dev", check=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("missing", p.stderr)
+        self.slice("adopt", "docs", "--from", "dev", "--branch", "review/docs")
+        self.commit("Imported intro", {"docs/index.md": "intro, clarified\n"})
+        self.slice("landed", "docs", self.d1, "--from", "dev")
+        self.git("branch", "-m", "dev", "feature")
+        self.slice("adopt", "docs", "--from", "feature", "--branch", "review/docs")
+        self.assertIn("manual checkpoints: " + self.d1[:10], self.slice("status", "docs", "--from", "feature").stdout)
+        self.git("switch", "-q", "feature")
+        self.commit("Later documentation", {"docs/later.md": "later\n"})
+        self.git("switch", "-q", "main")
+        self.slice("update", "docs", "--from", "feature")
+        self.assertEqual(self.show("review/docs", "docs/later.md"), "later\n")
+        self.assertEqual(self.git("for-each-ref", "--format=%(refname)", "refs/heads/pathslice"), "")
+
+    def test_inspecting_and_releasing_a_custom_export(self):
+        self.standard_dev()
+        self.slice("update", "docs", "--from", "dev", "--branch", "review/docs")
+        self.git("switch", "-q", "review/docs")
+        status = self.slice("status", "docs").stdout
+        self.assertIn("docs: dev -> main", status)
+        self.assertIn("branch review/docs", status)
+        p = self.slice("update", "docs", check=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("checked out", p.stderr)
+        head = self.commit("Independent change", {"notes/work.md": "keep this\n"})
+        self.assertIn("changed outside git pathslice", self.slice("status", "docs").stdout)
+        self.slice("release", "docs")
+        self.assertEqual(self.sha("review/docs"), head)
+        self.git("switch", "-q", "main")
+        p = self.slice("update", "docs", "--from", "dev", "--branch", "review/docs", check=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("not recorded as an export", p.stderr)
+        self.assertEqual(self.git("for-each-ref", "--format=%(refname)", "refs/heads/pathslice"), "")
 
 
 class TestLanding(Base):
@@ -676,6 +784,39 @@ class TestExportTracking(Base):
 
 
 class TestPush(Base):
+    def test_fresh_clone_preserves_amendments_despite_valid_trailers(self):
+        self.standard_dev()
+        bare = self.remote()
+        branch = "pathslice/docs/dev"
+        self.slice("update", "docs", "--from", "dev", "--push")
+        self.git("switch", "-q", branch)
+        exported = self.sha(branch)
+        for change in ("content", "metadata"):
+            with self.subTest(change=change):
+                self.git("reset", "--hard", exported)
+                if change == "content":
+                    self.write({"docs/feature.md": "new  feature page\n"})
+                    self.git("add", "docs/feature.md")
+                    self.git("commit", "-q", "--amend", "--no-edit")
+                else:
+                    message = self.git("log", "-1", "--format=%B").replace("Add feature and documentation", "Revised subject")
+                    self.git("commit", "-q", "--amend", "-m", message)
+                amended = self.sha(branch)
+                self.git("push", "-q", "--force", "origin", branch)
+                other = os.path.join(self.tmp, change)
+                self.git("clone", "-q", bare, other)
+                self.git("branch", "dev", "origin/dev", cwd=other)
+                self.slice("add", "docs", "docs/", "--base", "main", cwd=other)
+                p = self.slice("update", "docs", "--from", "dev", "--push", cwd=other, check=False)
+                self.assertNotEqual(p.returncode, 0)
+                self.assertIn("export %s differs" % change, p.stderr)
+                self.assertEqual(self.git("rev-parse", branch, cwd=bare).strip(), amended)
+                self.git("branch", "review/docs", "origin/" + branch, cwd=other)
+                p = self.slice("adopt", "docs", "--from", "dev", "--branch", "review/docs", cwd=other, check=False)
+                self.assertNotEqual(p.returncode, 0)
+                self.assertIn("export %s differs" % change, p.stderr)
+                self.assertEqual(self.git("rev-parse", "review/docs", cwd=other).strip(), amended)
+
     def test_unrecognised_remote_branch_is_preserved(self):
         self.standard_dev()
         bare = self.remote()
@@ -780,13 +921,13 @@ class TestPullRequest(Base):
                     print("https://example.invalid/pull/1")
                 '''))
         os.chmod(gh, 0o755)
-        self.slice("publish", "docs", "--from", "dev", "--draft")
+        self.slice("publish", "docs", "--from", "dev", "--branch", "review/docs", "--draft")
         self.git("switch", "-q", "dev")
         self.commit("Later documentation", {"docs/later.md": "later\n"})
         self.git("switch", "-q", "main")
         p = self.slice("pr", "docs", "--from", "dev")
         self.assertIn("using existing PR", p.stdout)
-        self.assertEqual(self.git("show", "pathslice/docs/dev:docs/later.md", cwd=bare), "later\n")
+        self.assertEqual(self.git("show", "review/docs:docs/later.md", cwd=bare), "later\n")
         self.env["GH_TEST_FAIL"] = "1"
         p = self.slice("publish", "docs", "--from", "dev", check=False)
         self.assertNotEqual(p.returncode, 0)
@@ -794,6 +935,8 @@ class TestPullRequest(Base):
         with open(calls) as f:
             commands = [json.loads(line) for line in f]
         self.assertEqual(sum(cmd[:2] == ["pr", "create"] for cmd in commands), 1)
+        self.slice("forget", "docs", "--from", "dev", "--branch")
+        self.assertEqual(self.git("for-each-ref", "--format=%(refname)", "refs/heads/review/docs"), "")
 
 
 if __name__ == "__main__":

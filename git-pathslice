@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, cast, overload
 
@@ -120,7 +121,7 @@ class Repo:
         return rc == 0
 
     def delete_ref(self, ref: str) -> None:
-        self.try_run("update-ref", "-d", ref)
+        self.try_run("update-ref", "--no-deref", "-d", ref)
 
     def current_branch(self) -> str | None:
         rc, out, _ = self.try_run("symbolic-ref", "--short", "-q", "HEAD")
@@ -133,6 +134,19 @@ class Repo:
                 path = line[len("worktree "):]
             elif line == "branch refs/heads/" + branch:
                 return path
+        # Rebase and bisect can detach HEAD while retaining use of a branch.
+        gitdirs = [self.common]
+        linked = os.path.join(self.common, "worktrees")
+        if os.path.isdir(linked):
+            gitdirs.extend(entry.path for entry in os.scandir(linked) if entry.is_dir())
+        for gitdir in gitdirs:
+            for state in ("rebase-merge/head-name", "rebase-apply/head-name",
+                          "rebase-merge/update-refs", "BISECT_START"):
+                filename = os.path.join(gitdir, state)
+                if os.path.isfile(filename):
+                    with open(filename) as f:
+                        if any(line.strip() in (branch, "refs/heads/" + branch) for line in f):
+                            return gitdir
         return None
 
     def worktree_registered(self, path: str) -> bool:
@@ -156,7 +170,8 @@ class Repo:
             _, out, err = self.try_run("am", "-h")
             _, mt_out, mt_err = self.try_run("merge-tree", "-h")
             self._features = {"am_no_verify": "--no-verify" in out + err,
-                              "merge_tree_write": "--write-tree" in mt_out + mt_err}
+                              "merge_tree_write": "--write-tree" in mt_out + mt_err,
+                              "apply_cached_3way": ver >= (2, 32)}
         return self._features
 
 
@@ -305,6 +320,25 @@ def branch_record_ref(branch: str) -> str:
     return REF_ROOT + "/branches/" + escape(branch)
 
 
+def branch_records(repo: Repo) -> list[tuple[str, str, ExportRecord]]:
+    records = []
+    for ref in repo.run("for-each-ref", "--format=%(refname)", REF_ROOT + "/branches/").splitlines():
+        sha, record = read_record(repo, ref)
+        if sha and record:
+            records.append((ref, sha, record))
+    return records
+
+
+def resolve_branch(repo: Repo, name: str, frm: str, branch: str | None = None) -> str:
+    if branch:
+        return branch
+    branches = [record["branch"] for _, _, record in branch_records(repo)
+                if record.get("slice") == name and record.get("source_ref") == frm and "branch" in record]
+    if len(branches) > 1:
+        raise SliceError("multiple exports exist for this slice and source; specify --branch")
+    return branches[0] if branches else branch_name(name, frm)
+
+
 def _local_branch_ref(repo: Repo, revision: str) -> str:
     rc, out, _ = repo.try_run("rev-parse", "--symbolic-full-name", "--verify", "--quiet", revision)
     ref = out.strip() if rc == 0 else ""
@@ -316,11 +350,19 @@ def _local_branch_ref(repo: Repo, revision: str) -> str:
     return ref
 
 
-def _check_target(repo: Repo, branch: str, name: str, frm: str,
-                  base: str | None, scope: str | None = None) -> str | None:
+def _check_branch_ref(repo: Repo, branch: str, frm: str, base: str | None) -> None:
+    repo.check_ref_format(branch)
     ref = "refs/heads/" + branch
+    if repo.try_run("symbolic-ref", "-q", ref)[0] == 0:
+        raise SliceError("export branch %s is a symbolic reference; use a direct branch" % branch)
     if any(ref == _local_branch_ref(repo, rev) for rev in (frm, base) if rev):
         raise SliceError("export branch %s is the source or destination branch; choose another --branch" % branch)
+
+
+def _check_target(repo: Repo, branch: str, name: str, frm: str,
+                  base: str | None, scope: str | None = None) -> str | None:
+    _check_branch_ref(repo, branch, frm, base)
+    ref = "refs/heads/" + branch
     head = repo.rev(ref)
     owner_sha, owner = read_record(repo, branch_record_ref(branch))
     if owner:
@@ -367,6 +409,7 @@ class Analysis:
     base: str
     base_sha: str
     branch: str
+    branch_explicit: bool
     branch_sha: str | None
     scope: str
     record_ref: str
@@ -449,7 +492,8 @@ def analyse(repo: Repo, sl: Slice, frm: str, base: str | None = None, all_: bool
     base_sha, frm_sha = repo.rev(base), repo.rev(frm)
     if not base_sha or not frm_sha:
         raise SliceError("source and base must both name commits")
-    branch = branch or branch_name(sl.name, frm)
+    explicit_branch = branch is not None
+    branch = resolve_branch(repo, sl.name, frm, branch)
     repo.check_ref_format(branch)
     branch_sha = repo.rev("refs/heads/" + branch)
     scope = projection_scope(sl, base)
@@ -493,7 +537,7 @@ def analyse(repo: Repo, sl: Slice, frm: str, base: str | None = None, all_: bool
     landed.update(equivalents)
     return Analysis(
         sl=sl, frm=frm, frm_sha=frm_sha,
-        base=base, base_sha=base_sha, branch=branch, branch_sha=branch_sha,
+        base=base, base_sha=base_sha, branch=branch, branch_explicit=explicit_branch, branch_sha=branch_sha,
         scope=scope, record_ref=record_ref, record_sha=record_sha, record=record,
         landed=landed, checkpoints=checkpoints, landed_how=landed_how,
         warnings=warnings, candidates=cands,
@@ -587,10 +631,14 @@ def _make_patch(repo: Repo, sha: str, paths: list[str], scope: str) -> bytes:
                     "format-patch", "-1", "-k", "--stdout", "--binary", "--full-index",
                     "--no-signature", "--no-thread", "--no-cover-letter", "--no-notes",
                     "--no-numbered", sha, "--", *paths, binary=True)
+    return _add_provenance(repo, patch, sha, scope)
+
+
+def _add_provenance(repo: Repo, content: bytes, sha: str, scope: str) -> bytes:
     return repo.run("interpret-trailers", "--if-exists", "addIfDifferent",
                     "--trailer", "%s: %s" % (TRAILER, sha),
                     "--trailer", "%s: %s %s" % (SCOPE_TRAILER, scope, sha),
-                    input=patch, binary=True)
+                    input=content, binary=True)
 
 
 def _committer_env(repo: Repo, src_sha: str) -> dict[str, str]:
@@ -642,14 +690,14 @@ def _finalise(repo: Repo, st: UpdateState, quiet: bool = False) -> str:
         record_sha = record_commit(repo, record, record_sha)
     at = repo.branch_checked_out_at(st["branch"])
     if at:
-        raise SliceError("branch %s is checked out at %s; detach it first" % (st["branch"], at))
+        raise SliceError("branch %s is checked out or in use at %s; finish the Git operation or switch branches" % (st["branch"], at))
     zero = "0" * len(head)
     # A prior attempt may have committed the refs before removing its journal.
     if (repo.rev(st["record_ref"]) == record_sha and owner_sha == record_sha
             and repo.rev("refs/heads/" + st["branch"]) == head):
         st["record_before"], st["branch_before"] = record_sha, head
         st["owner_before"] = record_sha
-    repo.run("update-ref", "--stdin", input=
+    repo.run("update-ref", "--no-deref", "--stdin", input=
              "update refs/heads/%s %s %s\nupdate %s %s %s\nupdate %s %s %s\n" % (
                  st["branch"], head, st["branch_before"] or zero,
                  st["record_ref"], record_sha, st["record_before"] or zero,
@@ -691,8 +739,11 @@ def do_update(repo: Repo, an: Analysis, push: str | None = None, quiet: bool = F
         raise SliceError("an update of slice '%s' is in progress; run continue or abort" % an.sl.name)
     at = repo.branch_checked_out_at(an.branch)
     if at:
-        raise SliceError("branch %s is checked out at %s; detach it first" % (an.branch, at))
+        raise SliceError("branch %s is checked out or in use at %s; finish the Git operation or switch branches" % (an.branch, at))
     owner_before = _check_target(repo, an.branch, an.sl.name, an.frm, an.base, an.scope)
+    if owner_before and not an.branch_sha and not an.branch_explicit:
+        raise SliceError("recorded branch %s is missing; use adopt --branch NEW_NAME after a rename, "
+                         "or update --branch %s to recreate it" % (an.branch, an.branch))
     for warning in an.warnings:
         sys.stderr.write("warning: %s\n" % warning)
     to_replay = an.to_replay()
@@ -722,6 +773,40 @@ def do_update(repo: Repo, an: Analysis, push: str | None = None, quiet: bool = F
 # Publication
 
 
+def _verify_export(repo: Repo, head: str, source: str, scope: str,
+                   base: str, paths: list[str]) -> tuple[str, list[str]]:
+    """Verify provenance and reproduce each exported tree in an isolated index."""
+    mb = repo.run("merge-base", base, head).strip()
+    revs = ["-1", head] if mb == head else [head, "^" + mb]
+    commits = repo.run("rev-list", "--reverse", "--topo-order", *revs).split()
+    sources = []
+    apply = ["apply", "--cached", "--whitespace=nowarn"]
+    if repo.features()["apply_cached_3way"]:
+        apply.append("--3way")
+    with tempfile.TemporaryDirectory(prefix="pathslice-verify-") as tmp:
+        env = {"GIT_INDEX_FILE": os.path.join(tmp, "index")}
+        for commit in commits:
+            provenance = _provenance(repo, scope, "-1", commit)
+            parents = repo.run("rev-list", "--parents", "-1", commit).split()[1:]
+            if (len(provenance) != 1 or len(parents) != 1
+                    or not repo.is_ancestor(provenance[0], source)):
+                raise SliceError("branch is not a recognised export for this scope and source history")
+            repo.run("read-tree", parents[0], env_extra=env)
+            rc, _, _ = repo.try_run(*apply, input=_make_patch(repo, provenance[0], paths, scope), env_extra=env)
+            if rc or repo.run("write-tree", env_extra=env).strip() != repo.run("rev-parse", commit + "^{tree}").strip():
+                raise SliceError("export content differs from its source patches; preserve the branch "
+                                 "and reconcile those changes in the source before updating")
+            metadata = "--format=%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI"
+            message = repo.run("log", "-1", "--format=%B", provenance[0], binary=True)
+            expected = _add_provenance(repo, message, provenance[0], scope).rstrip(b"\n")
+            if (repo.run("log", "-1", metadata, commit) != repo.run("log", "-1", metadata, provenance[0])
+                    or repo.run("log", "-1", "--format=%B", commit, binary=True).rstrip(b"\n") != expected):
+                raise SliceError("export metadata differs from its source; preserve the branch "
+                                 "and reconcile those changes in the source before updating")
+            sources.append(provenance[0])
+    return mb, sources if mb != head else []
+
+
 def _push(repo: Repo, remote: str, branch: str, source: str, scope: str, quiet: bool = False) -> None:
     ref = "refs/heads/" + branch
     local = repo.rev(ref)
@@ -739,20 +824,16 @@ def _push(repo: Repo, remote: str, branch: str, source: str, scope: str, quiet: 
     out = repo.run("ls-remote", url, ref).split()
     actual = out[0] if out else None
     if actual and not published:
-        mb = repo.run("merge-base", owner["base"], actual).strip()
-        revs = ["-1", actual] if mb == actual else [actual, "^" + mb]
-        sources = _provenance(repo, scope, *revs)
-        count = int(repo.run("rev-list", "--count", *revs))
-        if not sources or len(sources) != count or not all(repo.is_ancestor(src, source) for src in sources):
-            raise SliceError("the remote branch is not a recognised export for this scope and source history; "
-                             "preserve it or choose another branch")
+        # A matching accepted local export needs no reconstruction (e.g. after a failed push).
+        if actual != local or not owner["replayed"]:
+            _verify_export(repo, actual, source, scope, owner["base"], get_slice(repo, owner["slice"]).paths)
     if actual != local:
         if actual and actual != expected:
             raise SliceError("remote branch changed since the last accepted export; "
                              "inspect and reconcile it before publishing")
         repo.run("push", "--force-with-lease=%s:%s" % (ref, actual or ""), remote,
                  "%s:%s" % (local, ref))
-    repo.run("update-ref", published_ref, local, published or "0" * len(local))
+    repo.run("update-ref", "--no-deref", published_ref, local, published or "0" * len(local))
     if not quiet:
         print("%s is already up to date on %s" % (branch, remote) if actual == local
               else "pushed %s to %s" % (branch, remote))
@@ -775,6 +856,9 @@ def resolve_from(repo: Repo, frm: str | None) -> str:
     cur = repo.current_branch()
     if not cur:
         raise SliceError("HEAD is detached; specify the source branch with --from")
+    _, owner = read_record(repo, branch_record_ref(cur))
+    if owner and owner.get("source_ref"):
+        return owner["source_ref"]
     return cur
 
 
@@ -832,6 +916,12 @@ def cmd_list(repo: Repo, a: argparse.Namespace) -> None:
 
 def _print_analysis(repo: Repo, an: Analysis, verbose: bool = True) -> None:
     print("slice %s: %s -> %s  (branch %s)" % (an.sl.name, an.frm, an.base, an.branch))
+    try:
+        owner = _check_target(repo, an.branch, an.sl.name, an.frm, an.base, an.scope)
+        if owner and not an.branch_sha:
+            print("  warning: the recorded branch is missing; adopt its new name or explicitly recreate it")
+    except SliceError as e:
+        print("  warning: %s" % e)
     if an.branch_sha:
         ahead = repo.run("rev-list", "--count", an.base_sha + ".." + an.branch_sha).strip()
         stale = "" if an.record and an.record["source"] == an.frm_sha else ", built from an older %s" % an.frm
@@ -872,7 +962,7 @@ def cmd_status(repo: Repo, a: argparse.Namespace) -> None:
     for name in names:
         sl = get_slice(repo, name)
         try:
-            an = analyse(repo, sl, frm, a.onto, a.all)
+            an = analyse(repo, sl, frm, a.onto, a.all, a.branch)
         except SliceError as e:
             print("slice %s: %s" % (name, e))
             continue
@@ -916,20 +1006,81 @@ def cmd_resume(repo: Repo, a: argparse.Namespace) -> int:
     return 0 if _run_queue(repo, st, a.quiet) else 1
 
 
+def cmd_adopt(repo: Repo, a: argparse.Namespace) -> None:
+    an = analyse(repo, get_slice(repo, a.name), a.frm, a.onto, branch=a.branch)
+    _check_branch_ref(repo, an.branch, an.frm, an.base)
+    head = an.branch_sha
+    if not head:
+        raise SliceError("branch %s does not exist" % an.branch)
+    owner_ref = branch_record_ref(an.branch)
+    owner_sha, owner = read_record(repo, owner_ref)
+    if owner and owner.get("slice") != a.name:
+        raise SliceError("branch belongs to another slice; release it before adopting it")
+    for frm in {an.frm, owner.get("source_ref", an.frm) if owner else an.frm}:
+        if _load_state(repo, a.name, frm):
+            raise SliceError("an update is in progress; finish or abort it before adopting the branch")
+    known = [(ref, sha, record) for ref, sha, record in branch_records(repo)
+             if record["head"] == head and record.get("scope") == an.scope
+             and repo.is_ancestor(record["source"], an.frm_sha)]
+    landed, checkpoints = an.landed.copy(), an.checkpoints.copy()
+    if known:
+        previous = known[0][2]
+        export_base, replayed = previous["base"], previous["replayed"]
+        _, saved = read_record(repo, state_root(a.name, previous["source_ref"]) + "/exports/" + an.scope)
+        previous = saved or previous
+        if repo.is_ancestor(previous.get("checked_base", previous["base"]), an.base_sha):
+            landed.update(previous["landed"])
+        checkpoints.extend(cp for cp in previous.get("checkpoints", [])
+                           if cp not in checkpoints and repo.is_ancestor(cp, an.frm_sha))
+    else:
+        export_base, replayed = _verify_export(repo, head, an.frm_sha, an.scope, an.base_sha, an.sl.paths)
+    record: ExportRecord = {
+        "source": an.frm_sha, "base": export_base, "checked_base": an.base_sha, "head": head,
+        "replayed": replayed, "landed": sorted(landed), "checkpoints": checkpoints,
+        "slice": a.name, "source_ref": an.frm, "branch": an.branch, "scope": an.scope,
+    }
+    record_sha = record_commit(repo, record, an.record_sha)
+    zero = "0" * len(head)
+    updates = "verify refs/heads/%s %s\nupdate %s %s %s\nupdate %s %s %s\n" % (
+        an.branch, head, owner_ref, record_sha, owner_sha or zero,
+        an.record_ref, record_sha, an.record_sha or zero)
+    for ref, previous_sha, previous in known:
+        old_branch = previous["branch"]
+        if (ref != owner_ref and previous.get("source_ref") == an.frm
+                and not repo.rev("refs/heads/" + old_branch)):
+            updates += "verify refs/heads/%s %s\ndelete %s %s\n" % (
+                old_branch, zero, ref, previous_sha)
+    repo.run("update-ref", "--no-deref", "--stdin", input=updates)
+    print("adopted %s for slice %s from %s; branch unchanged" % (an.branch, a.name, an.frm))
+
+
+def cmd_release(repo: Repo, a: argparse.Namespace) -> None:
+    frm = resolve_from(repo, a.frm)
+    branch = resolve_branch(repo, a.name, frm, a.branch)
+    ref = branch_record_ref(branch)
+    sha, owner = read_record(repo, ref)
+    if not owner or (owner.get("slice"), owner.get("source_ref")) != (a.name, frm):
+        raise SliceError("branch is not managed for this slice and source")
+    if _load_state(repo, a.name, frm):
+        raise SliceError("an update is in progress; finish or abort it before releasing the branch")
+    repo.run("update-ref", "--no-deref", "-d", ref, sha or "")
+    print("released %s; branch and landing records unchanged" % branch)
+
+
 def cmd_forget(repo: Repo, a: argparse.Namespace) -> None:
     frm = resolve_from(repo, a.frm)
     root = state_root(a.name, frm)
     if a.branch:
-        br = branch_name(a.name, frm)
+        br = resolve_branch(repo, a.name, frm, a.export_branch)
         head = repo.rev("refs/heads/" + br)
         sl = load_slices(repo).get(a.name)
         base = (sl.base or default_base(repo)) if sl else None
         scope = projection_scope(sl, base) if sl and base else None
         owner = _check_target(repo, br, a.name, frm, base, scope)
         if repo.branch_checked_out_at(br):
-            raise SliceError("branch %s is checked out; detach it before removing it" % br)
+            raise SliceError("branch %s is checked out or in use; finish the Git operation or switch branches" % br)
         zero = "0" * len(head or owner or repo.run("rev-parse", "HEAD").strip())
-        repo.run("update-ref", "--stdin", input="%s refs/heads/%s %s\n%s %s %s\n" % (
+        repo.run("update-ref", "--no-deref", "--stdin", input="%s refs/heads/%s %s\n%s %s %s\n" % (
             "delete" if head else "verify", br, head or zero,
             "delete" if owner else "verify", branch_record_ref(br), owner or zero))
     for ref in repo.run("for-each-ref", "--format=%(refname)", root + "/exports/").splitlines():
@@ -956,7 +1107,7 @@ def cmd_landed(repo: Repo, a: argparse.Namespace) -> None:
     }
     record["checkpoints"] = checkpoints
     head = record_commit(repo, record, an.record_sha)
-    repo.run("update-ref", an.record_ref, head, an.record_sha or "0" * len(head))
+    repo.run("update-ref", "--no-deref", an.record_ref, head, an.record_sha or "0" * len(head))
     print("slice %s from %s: %s and its ancestors are treated as landed" % (a.name, frm, short(sha)))
 
 
@@ -968,7 +1119,7 @@ def cmd_publish(repo: Repo, a: argparse.Namespace) -> int:
     repo.run("fetch", a.remote)
     frm = resolve_from(repo, a.frm)
     sl = get_slice(repo, a.name)
-    an = analyse(repo, sl, frm, a.onto, a.all)
+    an = analyse(repo, sl, frm, a.onto, a.all, a.branch)
     if a.no_update:
         _check_target(repo, an.branch, an.sl.name, an.frm, an.base, an.scope)
     base = an.base.split("/", 1)[1] if an.base.startswith(a.remote + "/") else an.base
@@ -1019,7 +1170,7 @@ def build_parser() -> argparse.ArgumentParser:
                all_: bool = True, branch: bool = False, quiet: bool = False) -> None:
         if frm:
             sp.add_argument("--from", dest="frm", metavar="BRANCH",
-                            help="branch supplying committed changes (default: the current branch)")
+                            help="source of committed changes (default: the current branch or its recorded source)")
         if onto:
             sp.add_argument("--onto", metavar="BASE", help="destination ref (default: the slice's configured base)")
         if all_:
@@ -1027,7 +1178,7 @@ def build_parser() -> argparse.ArgumentParser:
                             help="ignore the selection rule; keep the slice's path restriction")
         if branch:
             sp.add_argument("--branch", metavar="NAME",
-                            help="name of the derived branch (default: pathslice/<name>/<from>)")
+                            help="export branch (default: the recorded branch or pathslice/<name>/<from>)")
         if quiet:
             sp.add_argument("-q", "--quiet", action="store_true", help="suppress progress summaries")
 
@@ -1059,7 +1210,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("status", help="summary of each slice for the current branch")
     sp.add_argument("name", nargs="?")
-    common(sp)
+    common(sp, branch=True)
     sp.set_defaults(func=cmd_status)
 
     sp = sub.add_parser("update", help="rebuild the derived branch")
@@ -1083,7 +1234,19 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("name")
     common(sp, onto=False, all_=False)
     sp.add_argument("--branch", action="store_true", help="also delete the derived branch")
+    sp.add_argument("--export-branch", metavar="NAME", help="choose the branch to delete with --branch")
     sp.set_defaults(func=cmd_forget)
+
+    sp = sub.add_parser("adopt", help="verify and manage an existing export, including after a rename or clone")
+    sp.add_argument("name")
+    common(sp, frm=False, all_=False, branch=True)
+    sp.add_argument("--from", dest="frm", required=True, metavar="BRANCH", help="source of the exported changes")
+    sp.set_defaults(func=cmd_adopt)
+
+    sp = sub.add_parser("release", help="leave an export as an ordinary Git branch")
+    sp.add_argument("name")
+    common(sp, onto=False, all_=False, branch=True)
+    sp.set_defaults(func=cmd_release)
 
     sp = sub.add_parser("landed", help="declare a revision and its ancestors accounted for")
     sp.add_argument("name")
@@ -1100,7 +1263,7 @@ def build_parser() -> argparse.ArgumentParser:
                "Use 'git pathslice log specs' to preview the selection. 'pr' is an alias for 'publish'.",
     )
     sp.add_argument("name", metavar="SLICE", help="configured slice defining the paths and destination")
-    common(sp, quiet=True)
+    common(sp, branch=True, quiet=True)
     sp.add_argument("--remote", default="origin", help="remote to fetch and push (default: %(default)s)")
     sp.add_argument("--title", help="title when creating a PR")
     sp.add_argument("--draft", action="store_true", help="create a new PR as a draft")
