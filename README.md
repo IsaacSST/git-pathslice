@@ -35,6 +35,8 @@ git add .gitpathslices
 git commit -m "Define the specifications slice"
 ```
 
+`add` stores the definition. `update` and `publish` create the slice branch.
+
 `.gitpathslices` uses Git configuration syntax and permits multiple `path`
 entries. Local definitions in `.git/config` can add paths or override other
 settings. Paths are Git pathspecs relative to the repository root; `add`
@@ -42,17 +44,22 @@ also accepts paths relative to the current directory.
 
 ## Use
 
-Run from the implementation branch:
+Publish the configured specifications slice from your implementation branch:
 
 ```sh
-git pathslice log specs       # preview the selection
-git pathslice update specs    # build locally
-git pathslice pr specs        # fetch, build, push and create or update the PR
+git pathslice publish specs
 ```
 
-The first two commands are optional. `pr` reuses an open PR and exits without
-publishing if there are no changes. Continue editing the source branch and
-rerun `pr`; do not edit the derived branch, `pathslice/specs/<source-branch>`.
+`specs` names the slice defined above: it selects `specs/` and targets
+`origin/main`. `publish` fetches the remote, prepares a separate slice branch,
+pushes it, then creates a PR or reuses an open one. `pr` is an alias for
+`publish`.
+
+Each slice/source pair gets a branch named `pathslice/<slice>/<source>`.
+For a source branch named `feature`, the PR runs from `pathslice/specs/feature`
+into `main`. Later runs update that slice branch; the implementation branch
+remains unchanged. Only committed changes are eligible; uncommitted edits are
+excluded.
 
 A source commit changing `src/pump.rs` and `specs/pump.md` contributes only
 the specification change. The restricted patch and provenance trailers give
@@ -60,8 +67,20 @@ it a different commit hash; code retains the destination's version. Merge
 the PR through the usual review process. Later exports omit recognised
 changes already incorporated into the destination.
 
-`log` and `update` use local refs; `pr` fetches first. Use `--from BRANCH`
-to select another source or `--onto REF` to override the destination.
+While the PR is open, edit the source branch and rerun `publish` to update it.
+It exits without publishing if there are no changes. For separate steps:
+
+| Command | Behaviour |
+| --- | --- |
+| `log specs` | Preview which commits contribute changes, using local refs. |
+| `update specs` | Prepare the slice branch locally, without fetching. |
+| `update specs --push` | Prepare and push the slice branch, without fetching or opening a PR. |
+
+Use `--from BRANCH` to select another source or `--onto REF` to override the
+destination, for example `--from feature --onto origin/main`.
+`publish --no-update specs` uses the existing slice branch without exporting
+new source changes. It still fetches, pushes and creates or reuses a PR.
+
 Unchanged exports retain their hashes. Destination changes alone do not
 rebuild an open PR; `--force-rebuild` requests this and rewrites the export
 commits. Conflicts with the destination are reported when Git supports the
@@ -120,7 +139,7 @@ git pathslice abort specs     # discard the update
 ```
 
 `continue` preserves commit metadata. `abort` retains the previous derived
-branch. If `pr` stopped on a conflict, rerun it after `continue` to publish.
+branch. If `publish` stopped on a conflict, rerun it after `continue` to publish.
 
 Pushes use an explicit lease against the last accepted export. Unexpected
 remote changes are refused even after a background fetch. A new checkout
@@ -130,8 +149,7 @@ Failed pushes leave the local export available for retry.
 ## Other commands
 
 `list` and `status` inspect slices; `rm` removes definitions. `forget` removes
-export records and checkpoints but retains publication leases. `update --push`
-publishes without a PR; `pr --no-update` publishes the existing derived branch.
+export records and checkpoints but retains publication leases.
 Use `git pathslice COMMAND -h` for options.
 
 ## Limits and tests
