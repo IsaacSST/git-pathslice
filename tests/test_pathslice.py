@@ -1,4 +1,4 @@
-"""Scenario tests for git-pathslice.  Run with: python3 -m unittest discover -s tests -v"""
+"""Git history scenarios for git-pathslice."""
 import json
 import os
 import shutil
@@ -31,12 +31,10 @@ class Base(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    # helpers ------------------------------------------------------------
-    def git(self, *args, cwd=None, input=None, check=True, binary=False):
+    def git(self, *args, cwd=None, binary=False):
         p = subprocess.run(["git", *args], cwd=cwd or self.repo, env=self.env,
-                           input=input if binary or input is None else input.encode(),
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if check and p.returncode != 0:
+        if p.returncode != 0:
             raise AssertionError("git %s failed: %s" % (" ".join(args), p.stderr.decode()))
         return p.stdout if binary else p.stdout.decode()
 
@@ -78,9 +76,6 @@ class Base(unittest.TestCase):
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         return p.returncode == 0
 
-    def count(self, a, b):
-        return int(self.git("rev-list", "--count", "%s..%s" % (a, b)).strip())
-
     def subjects(self, a, b):
         return self.git("log", "--reverse", "--format=%s", "%s..%s" % (a, b)).splitlines()
 
@@ -103,20 +98,19 @@ class Base(unittest.TestCase):
                 if line.startswith("worktree ")]
 
     def standard_dev(self):
-        """dev: docs-only, mixed (+feature, -old, index edit, code), code-only.  main: own docs change."""
+        """Source has pure, mixed and code commits; base has a separate document."""
         self.git("switch", "-q", "-c", "dev")
         self.d1 = self.commit("docs: clarify intro", {"docs/index.md": "intro, clarified\n"},
                               author="Other <other@example.com>")
-        self.d2 = self.commit("feat: thing + docs", {"src/a.py": "x=2\n", "docs/feature.md": "new feature page\n",
-                                                     "docs/old.md": None, "docs/index.md": "intro, clarified, more\n"})
-        self.d3 = self.commit("code only", {"src/a.py": "x=2\ny=3\n"})
+        self.d2 = self.commit("Add feature and documentation", {"src/a.py": "x=2\n", "docs/feature.md": "new feature page\n",
+                                                                "docs/old.md": None, "docs/index.md": "intro, clarified, more\n"})
+        self.commit("code only", {"src/a.py": "x=2\ny=3\n"})
         self.git("switch", "-q", "main")
-        self.m1 = self.commit("main docs change", {"docs/changelog.md": "changelog\n"})
+        self.commit("main docs change", {"docs/changelog.md": "changelog\n"})
         self.slice("add", "docs", "docs/", "--base", "main")
 
     def assert_standard_result(self, branch="pathslice/docs/dev"):
-        self.assertEqual(self.count("main", branch), 2)
-        self.assertEqual(self.subjects("main", branch), ["docs: clarify intro", "feat: thing + docs"])
+        self.assertEqual(self.subjects("main", branch), ["docs: clarify intro", "Add feature and documentation"])
         self.assertEqual(self.show(branch, "src/a.py"), "x=1\n")
         self.assertEqual(self.show(branch, "docs/index.md"), "intro, clarified, more\n")
         self.assertTrue(self.exists(branch, "docs/feature.md"))
@@ -138,22 +132,13 @@ class TestUpdate(Base):
                              self.git("log", "-1", metadata, exported))
         self.assertEqual(len(self.worktrees()), 1)
         self.assertEqual(self.state_files(), [])
-        # the user's checkout is untouched
         self.assertEqual(self.git("symbolic-ref", "--short", "HEAD").strip(), "main")
         self.assertEqual(self.git("status", "--porcelain"), "")
-
-    def test_rerun_is_stable(self):
-        """Rebuilding with nothing changed must reproduce the same commit ids,
-        so there is nothing to force-push and no pull-request churn."""
-        self.standard_dev()
-        self.slice("update", "docs", "--from", "dev")
         first = self.sha("pathslice/docs/dev")
         self.slice("update", "docs", "--from", "dev")
-        self.assert_standard_result()
         self.assertEqual(self.sha("pathslice/docs/dev"), first)
 
     def test_rebuild_is_committer_independent(self):
-        """A rebuild by someone else (or by CI) yields the same commit ids."""
         self.standard_dev()
         self.slice("update", "docs", "--from", "dev")
         first = self.sha("pathslice/docs/dev")
@@ -163,12 +148,6 @@ class TestUpdate(Base):
                          "GIT_AUTHOR_NAME": "CI", "GIT_AUTHOR_EMAIL": "ci@example.com"})
         self.slice("update", "docs", "--from", "dev")
         self.assertEqual(self.sha("pathslice/docs/dev"), first)
-
-    def test_default_from_is_current_branch(self):
-        self.standard_dev()
-        self.git("switch", "-q", "dev")
-        self.slice("update", "docs")
-        self.assert_standard_result()
 
     def test_nothing_pending(self):
         self.git("switch", "-q", "-c", "dev")
@@ -181,11 +160,12 @@ class TestUpdate(Base):
                 self.assertIn("main + 0 commits", out)
                 self.assertEqual(self.sha("pathslice/docs/dev"), self.sha("main"))
 
-    def test_run_from_subdirectory(self):
+    def test_default_source_from_subdirectory(self):
         self.standard_dev()
-        out = self.slice("log", "docs", "--from", "dev", cwd=os.path.join(self.repo, "src")).stdout
+        self.git("switch", "-q", "dev")
+        out = self.slice("log", "docs", cwd=os.path.join(self.repo, "src")).stdout
         self.assertIn("pending: 2 commits", out)
-        self.slice("update", "docs", "--from", "dev", cwd=os.path.join(self.repo, "src"))
+        self.slice("update", "docs", cwd=os.path.join(self.repo, "src"))
         self.assert_standard_result()
 
     def test_binary_file(self):
@@ -223,11 +203,9 @@ class TestUpdate(Base):
 
 
 class TestLanding(Base):
-    """After the derived branch lands in main, the next update must not replay it again."""
-
     def land_then_continue(self):
         self.git("switch", "-q", "dev")
-        self.d4 = self.commit("docs: later note", {"docs/later.md": "later\n"})
+        self.commit("docs: later note", {"docs/later.md": "later\n"})
         self.git("switch", "-q", "main")
         self.slice("update", "docs", "--from", "dev")
         self.assertEqual(self.subjects("main", "pathslice/docs/dev"), ["docs: later note"])
@@ -323,14 +301,14 @@ class TestLanding(Base):
 
     def test_manual_landed(self):
         self.standard_dev()
-        # main already has d1's content, but in a commit whose patch differs, so patch ids do not match
+        # The extra changelog edit prevents patch equivalence.
         self.commit("hand-applied intro change", {"docs/index.md": "intro, clarified\n", "docs/changelog.md": "changelog 2\n"})
         self.slice("landed", "docs", self.d1, "--from", "dev")
         out = self.slice("log", "docs", "--from", "dev").stdout
         self.assertIn("pending: 1 commit", out)
         self.assertNotIn("docs: clarify intro", out)
         self.slice("update", "docs", "--from", "dev")
-        self.assertEqual(self.subjects("main", "pathslice/docs/dev"), ["feat: thing + docs"])
+        self.assertEqual(self.subjects("main", "pathslice/docs/dev"), ["Add feature and documentation"])
         self.assertEqual(self.show("pathslice/docs/dev", "docs/index.md"), "intro, clarified, more\n")
 
     def test_checkpoints_on_merged_side_branches_are_retained(self):
@@ -384,7 +362,7 @@ app["main"](["update", "docs", "--from", "dev"])
     def conflicting_setup(self):
         self.git("switch", "-q", "-c", "dev")
         self.c1 = self.commit("docs: reword intro", {"docs/index.md": "intro, reworded on dev\n"})
-        self.c2 = self.commit("docs: feature page", {"docs/feature.md": "feature\n"})
+        self.commit("docs: feature page", {"docs/feature.md": "feature\n"})
         self.git("switch", "-q", "main")
         self.commit("main rewords intro too", {"docs/index.md": "intro, reworded on main\n"})
         self.slice("add", "docs", "docs/", "--base", "main")
@@ -393,11 +371,9 @@ app["main"](["update", "docs", "--from", "dev"])
         self.assertIn("conflict while replaying", p.stderr)
         self.assertIn("docs: reword intro", p.stderr)
         self.wt = os.path.join(self.repo, ".git", "pathslice", "wt", "docs", "dev")
-        self.assertTrue(os.path.isdir(self.wt))
         with open(os.path.join(self.wt, "docs", "index.md")) as f:
             self.assertIn("<<<<<<<", f.read())
         self.assertEqual(len(self.state_files()), 1)
-        # the user's own checkout is untouched
         self.assertEqual(self.git("status", "--porcelain"), "")
 
     def test_continue(self):
@@ -431,9 +407,7 @@ app["main"](["update", "docs", "--from", "dev"])
         self.assertFalse(os.path.exists(self.wt))
         self.assertEqual(self.state_files(), [])
         self.assertEqual(len(self.worktrees()), 1)
-        p = subprocess.run(["git", "rev-parse", "--verify", "-q", "pathslice/docs/dev"], cwd=self.repo, env=self.env,
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(self.git("for-each-ref", "--format=%(refname)", "refs/heads/pathslice/docs/dev"), "")
 
     def test_update_refused_while_in_progress(self):
         self.conflicting_setup()
@@ -457,7 +431,7 @@ class TestSelection(Base):
     def test_marked(self):
         self.git("switch", "-q", "-c", "dev")
         self.commit("docs: clarify intro", {"docs/index.md": "intro, clarified\n"})
-        self.commit("feat: thing + docs", {"src/a.py": "x=2\n", "docs/feature.md": "feature\n"})
+        self.commit("Add feature and documentation", {"src/a.py": "x=2\n", "docs/feature.md": "feature\n"})
         self.commit("update guide\n\nSlice: docs\n", {"docs/guide.md": "guide\n"})
         self.commit("more notes", {"docs/notes.md": "notes\n"})
         self.git("switch", "-q", "main")
@@ -473,10 +447,7 @@ class TestConfig(Base):
         self.standard_dev()
         self.slice("rm", "docs")
         self.slice("add", "docs", "docs/", "--base", "main", "--select", "pure", "--shared")
-        with open(os.path.join(self.repo, ".gitpathslices")) as f:
-            content = f.read()
-        self.assertIn('[pathslice "docs"]', content)
-        self.assertIn("path = docs/", content)
+        self.assertEqual(self.git("config", "--file", ".gitpathslices", "pathslice.docs.path").strip(), "docs/")
         self.assertIn("[shared]", self.slice("list").stdout)
         self.slice("update", "docs", "--from", "dev")
         self.assertEqual(self.subjects("main", "pathslice/docs/dev"), ["docs: clarify intro"])
@@ -520,8 +491,6 @@ class TestConfig(Base):
 
 
 class TestStability(Base):
-    """A pull request under review must not be disturbed by unrelated movement on base."""
-
     def test_base_moves_branch_stands_still(self):
         self.standard_dev()
         self.slice("update", "docs", "--from", "dev")
@@ -541,16 +510,6 @@ class TestStability(Base):
         self.assertNotEqual(self.sha("pathslice/docs/dev"), first)
         self.assertTrue(self.exists("pathslice/docs/dev", "src/c.py"))
         self.assert_standard_result()
-
-    def test_new_source_commit_still_rebuilds(self):
-        self.standard_dev()
-        self.slice("update", "docs", "--from", "dev")
-        self.git("switch", "-q", "dev")
-        self.commit("docs: later note", {"docs/later.md": "later\n"})
-        self.git("switch", "-q", "main")
-        self.slice("update", "docs", "--from", "dev")
-        self.assertEqual(self.subjects("main", "pathslice/docs/dev"),
-                         ["docs: clarify intro", "feat: thing + docs", "docs: later note"])
 
     def test_warns_when_kept_branch_conflicts_with_base(self):
         self.standard_dev()
@@ -629,6 +588,9 @@ class TestPush(Base):
         out = self.slice("update", "docs", "--from", "dev", "--push").stdout
         self.assertIn("pushed pathslice/docs/dev", out)
         self.assertEqual(self.git("rev-parse", "pathslice/docs/dev", cwd=bare).strip(), self.sha("pathslice/docs/dev"))
+        self.assertEqual(self.subjects("main", "pathslice/docs/dev"),
+                         ["docs: clarify intro", "Add feature and documentation", "docs: later note"])
+        self.assertEqual(self.git("show", "pathslice/docs/dev:docs/later.md", cwd=bare), "later\n")
 
     def test_failed_publication_can_be_retried(self):
         self.standard_dev()
