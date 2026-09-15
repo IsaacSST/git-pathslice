@@ -1,17 +1,5 @@
 #!/usr/bin/env python3
-"""git pathslice: path-scoped branches derived from another branch.
-
-A slice names a set of paths (for example docs/) and a base branch (for
-example main).  `git pathslice update <name>` rebuilds the branch
-pathslice/<name>/<from> as <base> plus the commits on <from> that touch the
-slice's paths, each restricted to those paths, skipping whatever <base>
-already contains.  The result can be pull-requested into <base> on its own.
-
-Export records are kept under refs/pathslices/, scoped to the slice's paths
-and destination. Each record identifies the commits exported and those known
-to have landed. Interrupted updates retain their temporary worktree.
-
-"""
+"""git pathslice: export selected paths as separate commits."""
 from __future__ import annotations
 
 import argparse
@@ -23,7 +11,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 VERSION = "0.2.0"
 SHARED_FILE = ".gitpathslices"
@@ -59,7 +47,7 @@ def short(sha):
     return sha[:10]
 
 
-# --------------------------------------------------------------------- repo
+# Repository
 
 
 class Repo:
@@ -71,7 +59,7 @@ class Repo:
         self.common = os.path.abspath(os.path.join(self.top, self.run("rev-parse", "--git-common-dir").strip()))
         wt_root = os.path.join(self.common, "pathslice", "wt")
         if os.path.realpath(self.top).startswith(os.path.realpath(wt_root) + os.sep):
-            # invoked from inside one of our temporary worktrees: use the main one
+            # Resolve commands from temporary worktrees against the main checkout.
             first = self.run("worktree", "list", "--porcelain").splitlines()[0]
             self.top = first[len("worktree "):]
         self._features = None
@@ -82,7 +70,8 @@ class Repo:
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
         return p.returncode, p.stdout, p.stderr
 
-    def try_run(self, *args, input=None, cwd=None, binary=False, env_extra=None) -> Tuple[int, object, str]:
+    def try_run(self, *args, input=None, cwd=None, binary=False,
+                env_extra=None) -> Tuple[int, Union[str, bytes], str]:
         env = _clean_env() if (cwd or env_extra) else None
         if env_extra:
             env.update(env_extra)
@@ -95,7 +84,6 @@ class Repo:
             raise SliceError("git %s failed:\n%s" % (" ".join(args[:2]), err.strip()))
         return out
 
-    # refs -------------------------------------------------------------
     def rev(self, rev) -> Optional[str]:
         rc, out, _ = self.try_run("rev-parse", "--verify", "--quiet", rev + "^{commit}")
         return out.strip() if rc == 0 else None
@@ -105,9 +93,6 @@ class Repo:
         if rc not in (0, 1):
             raise SliceError(err.strip())
         return rc == 0
-
-    def update_ref(self, ref, sha):
-        self.run("update-ref", ref, sha)
 
     def delete_ref(self, ref):
         self.try_run("update-ref", "-d", ref)
@@ -137,7 +122,6 @@ class Repo:
         if rc != 0:
             raise SliceError("'%s' is not a valid branch name" % branch)
 
-    # features ---------------------------------------------------------
     def features(self) -> Dict[str, bool]:
         if self._features is None:
             m = re.search(r"(\d+)\.(\d+)", self.run("--version"))
@@ -151,7 +135,7 @@ class Repo:
         return self._features
 
 
-# ------------------------------------------------------------------- config
+# Configuration
 
 @dataclass
 class Slice:
@@ -216,7 +200,7 @@ def default_base(repo) -> str:
     for cand in ("main", "master"):
         if repo.rev(cand):
             return cand
-    raise SliceError("cannot guess a base branch; set one with --base")
+    raise SliceError("cannot determine the base branch; specify --base")
 
 
 def get_slice(repo, name) -> Slice:
@@ -236,6 +220,9 @@ def normalise_path(repo, p: str) -> str:
     if prefix not in ("", ".") and not p.startswith(":"):
         p = os.path.normpath(os.path.join(prefix, p))
     return p
+
+
+# Export records
 
 
 def state_root(name, frm):
@@ -280,7 +267,7 @@ def state_path(repo, name, frm) -> str:
     return os.path.join(repo.common, "pathslice", "state", escape(name), escape(frm) + ".json")
 
 
-# ----------------------------------------------------------------- analysis
+# Analysis
 
 @dataclass
 class Candidate:
@@ -426,7 +413,7 @@ def analyse(repo, sl: Slice, frm: str, base: Optional[str] = None, all_: bool = 
     return Analysis(sl, frm, frm_sha, base, base_sha, branch, branch_sha, scope,
                     record_ref, record_sha, record, landed, checkpoints, landed_how, warnings, cands)
 
-# -------------------------------------------------------------------- build
+# Updates
 
 
 def _save_state(repo, st, create=False):
@@ -497,7 +484,7 @@ def _make_patch(repo, sha, paths, scope) -> bytes:
 
 
 def _committer_env(repo, src_sha) -> Dict[str, str]:
-    """Use the source committer identity and date for deterministic replay."""
+    """Preserve committer metadata for deterministic replay."""
     name, email, date = repo.run("log", "-1", "--format=%cn%x1f%ce%x1f%cI", src_sha).strip().split("\x1f")
     return {"GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": email, "GIT_COMMITTER_DATE": date}
 
@@ -566,36 +553,6 @@ def _finalise(repo, st, quiet=False):
     return head
 
 
-def _push(repo, remote, branch, source, scope, quiet=False):
-    ref = "refs/heads/" + branch
-    local = repo.rev(ref)
-    rc, url, _ = repo.try_run("remote", "get-url", "--push", remote)
-    url = url.strip() if rc == 0 else remote
-    key = hashlib.sha256(json.dumps([url, ref]).encode()).hexdigest()
-    published_ref = REF_ROOT + "/published/" + key
-    published = repo.rev(published_ref)
-    expected = published or repo.rev("refs/remotes/%s/%s" % (remote, branch))
-    out = repo.run("ls-remote", url, ref).split()
-    actual = out[0] if out else None
-    if actual != local:
-        if actual and actual != expected:
-            raise SliceError("remote branch changed since the last accepted export; "
-                             "inspect and reconcile it before publishing")
-        if actual and not published and not repo.is_ancestor(actual, local):
-            mb = repo.run("merge-base", local, actual).strip()
-            sources = _provenance(repo, scope, actual, "^" + mb)
-            count = int(repo.run("rev-list", "--count", actual, "^" + mb))
-            if len(sources) != count or not all(repo.is_ancestor(src, source) for src in sources):
-                raise SliceError("the remote export does not match this scope and source history; "
-                                 "reconcile it before publishing")
-        repo.run("push", "--force-with-lease=%s:%s" % (ref, actual or ""), remote,
-                 "%s:%s" % (local, ref))
-    repo.run("update-ref", published_ref, local, published or "0" * len(local))
-    if not quiet:
-        print("%s is already up to date on %s" % (branch, remote) if actual == local
-              else "pushed %s to %s" % (branch, remote))
-
-
 def _branch_encodes(repo, an: Analysis, to_replay) -> bool:
     if not an.branch_sha or not to_replay:
         return False
@@ -641,7 +598,48 @@ def do_update(repo, an: Analysis, push=None, quiet=False, force_rebuild=False):
     return _run_queue(repo, st, quiet)
 
 
-# ----------------------------------------------------------------- commands
+# Publication
+
+
+def _push(repo, remote, branch, source, scope, quiet=False):
+    ref = "refs/heads/" + branch
+    local = repo.rev(ref)
+    rc, url, _ = repo.try_run("remote", "get-url", "--push", remote)
+    url = url.strip() if rc == 0 else remote
+    key = hashlib.sha256(json.dumps([url, ref]).encode()).hexdigest()
+    published_ref = REF_ROOT + "/published/" + key
+    published = repo.rev(published_ref)
+    expected = published or repo.rev("refs/remotes/%s/%s" % (remote, branch))
+    out = repo.run("ls-remote", url, ref).split()
+    actual = out[0] if out else None
+    if actual != local:
+        if actual and actual != expected:
+            raise SliceError("remote branch changed since the last accepted export; "
+                             "inspect and reconcile it before publishing")
+        if actual and not published and not repo.is_ancestor(actual, local):
+            mb = repo.run("merge-base", local, actual).strip()
+            sources = _provenance(repo, scope, actual, "^" + mb)
+            count = int(repo.run("rev-list", "--count", actual, "^" + mb))
+            if len(sources) != count or not all(repo.is_ancestor(src, source) for src in sources):
+                raise SliceError("the remote export does not match this scope and source history; "
+                                 "reconcile it before publishing")
+        repo.run("push", "--force-with-lease=%s:%s" % (ref, actual or ""), remote,
+                 "%s:%s" % (local, ref))
+    repo.run("update-ref", published_ref, local, published or "0" * len(local))
+    if not quiet:
+        print("%s is already up to date on %s" % (branch, remote) if actual == local
+              else "pushed %s to %s" % (branch, remote))
+
+
+def github(repo, *args):
+    p = subprocess.run(["gh", *args], cwd=repo.top, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, text=True)
+    if p.returncode:
+        raise SliceError("gh failed: " + p.stderr.strip())
+    return p.stdout.strip()
+
+
+# Commands
 
 
 def resolve_from(repo, frm: Optional[str]) -> str:
@@ -649,13 +647,13 @@ def resolve_from(repo, frm: Optional[str]) -> str:
         return frm
     cur = repo.current_branch()
     if not cur:
-        raise SliceError("HEAD is detached; say which branch to slice with --from")
+        raise SliceError("HEAD is detached; specify the source branch with --from")
     return cur
 
 
 def cmd_add(repo, a):
     if not a.paths:
-        raise SliceError("give at least one path")
+        raise SliceError("specify at least one path")
     if a.select not in SELECTS:
         raise SliceError("--select must be one of " + ", ".join(SELECTS))
     existing = load_slices(repo).get(a.name)
@@ -800,7 +798,7 @@ def cmd_forget(repo, a):
         br = branch_name(a.name, frm)
         if repo.rev("refs/heads/" + br):
             repo.run("branch", "-D", br)
-    print("forgot the sync state of slice %s from %s" % (a.name, frm))
+    print("removed export records for slice %s from %s" % (a.name, frm))
 
 
 def cmd_landed(repo, a):
@@ -819,15 +817,7 @@ def cmd_landed(repo, a):
                                "head": None, "replayed": [], "landed": []}, checkpoints=checkpoints)
     head = record_commit(repo, record, an.record_sha)
     repo.run("update-ref", an.record_ref, head, an.record_sha or "0" * len(head))
-    print("slice %s from %s: everything up to %s is now treated as landed" % (a.name, frm, short(sha)))
-
-
-def github(repo, *args):
-    p = subprocess.run(["gh", *args], cwd=repo.top, stdout=subprocess.PIPE,
-                       stderr=subprocess.PIPE, text=True)
-    if p.returncode:
-        raise SliceError("gh failed: " + p.stderr.strip())
-    return p.stdout.strip()
+    print("slice %s from %s: %s and its ancestors are treated as landed" % (a.name, frm, short(sha)))
 
 
 def cmd_pr(repo, a):
@@ -866,11 +856,11 @@ def cmd_pr(repo, a):
     return 0
 
 
-# --------------------------------------------------------------------- main
+# Command-line interface
 
 
 def build_parser():
-    p = argparse.ArgumentParser(prog="git pathslice", description=__doc__.split("\n\n")[0])
+    p = argparse.ArgumentParser(prog="git pathslice", description=__doc__)
     p.add_argument("--version", action="version", version="git-pathslice " + VERSION)
     sub = p.add_subparsers(dest="cmd", metavar="<command>")
 
@@ -891,14 +881,14 @@ def build_parser():
 
     sp = sub.add_parser("add", help="define a slice")
     sp.add_argument("name")
-    sp.add_argument("paths", nargs="*", metavar="path", help="paths or pathspecs that make up the slice")
+    sp.add_argument("paths", nargs="*", metavar="path", help="paths or pathspecs to export")
     sp.add_argument("--base", metavar="BRANCH", help="branch the slice lands on (default: origin/HEAD, main or master)")
     sp.add_argument("--select", default="all", metavar="RULE",
                     help="all: every commit touching the paths (restricted to them); "
-                         "pure: only commits that touch nothing else; "
-                         "marked: only commits with a 'Slice: <name>' trailer or a matching --subject")
-    sp.add_argument("--subject", metavar="REGEX", help="with --select marked: subjects matching this count as marked")
-    sp.add_argument("--shared", action="store_true", help="write to %s (committed) instead of .git/config" % SHARED_FILE)
+                         "pure: commits restricted to those paths; "
+                         "marked: commits matching 'Slice: <name>' or --subject")
+    sp.add_argument("--subject", metavar="REGEX", help="subject pattern for --select marked")
+    sp.add_argument("--shared", action="store_true", help="write the definition to %s" % SHARED_FILE)
     sp.set_defaults(func=cmd_add)
 
     sp = sub.add_parser("rm", help="remove a slice definition")
@@ -910,7 +900,7 @@ def build_parser():
     sp = sub.add_parser("list", help="list slices")
     sp.set_defaults(func=cmd_list)
 
-    sp = sub.add_parser("log", help="show what an update would do, commit by commit")
+    sp = sub.add_parser("log", help="show the selection for each commit")
     sp.add_argument("name")
     common(sp, branch=True)
     sp.set_defaults(func=cmd_log)
@@ -926,8 +916,7 @@ def build_parser():
     sp.add_argument("--push", nargs="?", const="origin", metavar="REMOTE",
                     help="publish the derived branch with an explicit lease (default remote: origin)")
     sp.add_argument("--force-rebuild", action="store_true",
-                    help="rebuild onto the current base even if the branch already holds the right "
-                         "commits (changes commit ids, so an open PR is force-pushed)")
+                    help="rebuild on the current base, rewriting export commits")
     sp.set_defaults(func=cmd_update)
 
     for name, hlp in (("continue", "resume an update after resolving a conflict"),
@@ -938,26 +927,27 @@ def build_parser():
         common(sp, onto=False, all_=False, quiet=True)
         sp.set_defaults(func=cmd_resume)
 
-    sp = sub.add_parser("forget", help="drop the recorded sync state for a source branch")
+    sp = sub.add_parser("forget", help="remove export records and checkpoints for a source branch")
     sp.add_argument("name")
     common(sp, onto=False, all_=False)
     sp.add_argument("--branch", action="store_true", help="also delete the derived branch")
     sp.set_defaults(func=cmd_forget)
 
-    sp = sub.add_parser("landed", help="declare that everything up to a commit is already in base")
+    sp = sub.add_parser("landed", help="declare a revision and its ancestors accounted for")
     sp.add_argument("name")
     sp.add_argument("rev")
     common(sp, onto=False, all_=False)
     sp.set_defaults(func=cmd_landed)
 
-    sp = sub.add_parser("pr", help="update, push and open (or refresh) a pull request with gh")
+    sp = sub.add_parser("pr", help="build, push and create or update a pull request")
     sp.add_argument("name")
     common(sp, quiet=True)
     sp.add_argument("--remote", default="origin")
     sp.add_argument("--title")
     sp.add_argument("--draft", action="store_true")
     sp.add_argument("--no-update", action="store_true", help="push the branch as it is")
-    sp.add_argument("--force-rebuild", action="store_true", help="see `git pathslice update --force-rebuild`")
+    sp.add_argument("--force-rebuild", action="store_true",
+                    help="rebuild on the current base, rewriting export commits")
     sp.set_defaults(func=cmd_pr)
     return p
 
