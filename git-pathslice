@@ -330,7 +330,7 @@ def _describe(repo, shas: List[str], sl: Slice) -> List[Candidate]:
                        *pathspec, input=stdin)
         res = {}
         for chunk in out.split("\0"):
-            lines = [l for l in chunk.splitlines() if l.strip()]
+            lines = [line for line in chunk.splitlines() if line.strip()]
             if lines:
                 res[lines[0]] = set(lines[1:])
         return res
