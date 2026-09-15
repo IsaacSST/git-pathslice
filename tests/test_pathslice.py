@@ -1,9 +1,11 @@
 """Scenario tests for git-pathslice.  Run with: python3 -m unittest discover -s tests -v"""
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -16,7 +18,7 @@ class Base(unittest.TestCase):
         env = {k: v for k, v in os.environ.items()
                if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_PREFIX")}
         env.update({
-            "HOME": self.tmp, "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_AUTHOR_NAME": "Dev", "GIT_AUTHOR_EMAIL": "dev@example.com",
             "GIT_COMMITTER_NAME": "Dev", "GIT_COMMITTER_EMAIL": "dev@example.com",
         })
@@ -88,6 +90,13 @@ class Base(unittest.TestCase):
         for d, _, fs in os.walk(root):
             found += [os.path.join(d, f) for f in fs]
         return found
+
+    def remote(self):
+        bare = os.path.join(self.tmp, "remote.git")
+        self.git("init", "-q", "--bare", "-b", "main", bare)
+        self.git("remote", "add", "origin", bare)
+        self.git("push", "-q", "origin", "main", "dev")
+        return bare
 
     def worktrees(self):
         return [l for l in self.git("worktree", "list", "--porcelain").splitlines() if l.startswith("worktree ")]
@@ -305,8 +314,54 @@ class TestLanding(Base):
         self.assertEqual(self.subjects("main", "pathslice/docs/dev"), ["feat: thing + docs"])
         self.assertEqual(self.show("pathslice/docs/dev", "docs/index.md"), "intro, clarified, more\n")
 
+    def test_checkpoints_on_merged_side_branches_are_retained(self):
+        self.git("switch", "-q", "-c", "side")
+        side = self.commit("Side documentation", {"docs/side.md": "side\n"})
+        self.git("switch", "-q", "-c", "dev", "main")
+        first = self.commit("First documentation", {"docs/first.md": "first\n"})
+        self.git("merge", "-q", "--no-edit", "side")
+        self.commit("Later documentation", {"docs/later.md": "later\n"})
+        self.git("switch", "-q", "main")
+        self.commit("Imported documentation", {"docs/side.md": "side\n", "docs/first.md": "first\n"})
+        self.slice("add", "docs", "docs/", "--base", "main")
+        for checkpoint in (first, side):
+            self.slice("landed", "docs", checkpoint, "--from", "dev")
+        self.slice("update", "docs", "--from", "dev")
+        self.assertEqual(self.subjects("main", "pathslice/docs/dev"), ["Later documentation"])
+        self.assertEqual(self.show("pathslice/docs/dev", "docs/side.md"), "side\n")
+
 
 class TestConflicts(Base):
+    def test_branch_changed_during_resolution_is_preserved(self):
+        self.conflicting_setup()
+        self.git("branch", "pathslice/docs/dev", "main")
+        with open(os.path.join(self.wt, "docs", "index.md"), "w") as f:
+            f.write("resolved intro\n")
+        self.git("add", "docs/index.md", cwd=self.wt)
+        p = self.slice("continue", "docs", "--from", "dev", check=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(self.sha("pathslice/docs/dev"), self.sha("main"))
+        self.slice("abort", "docs", "--from", "dev")
+
+    def test_resume_after_interrupted_journal_write_preserves_commits(self):
+        self.standard_dev()
+        script = '''
+import runpy, sys
+app = runpy.run_path(sys.argv[1], run_name="test")
+save = app["_save_state"]
+def interrupt(repo, state, create=False):
+    if not create:
+        raise SystemExit(99)
+    save(repo, state, create=True)
+app["_run_queue"].__globals__["_save_state"] = interrupt
+app["main"](["update", "docs", "--from", "dev"])
+'''
+        p = subprocess.run([sys.executable, "-c", script, SLICE], cwd=self.repo, env=self.env,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(p.returncode, 99, p.stderr.decode())
+        self.slice("continue", "docs", "--from", "dev")
+        self.assert_standard_result()
+
     def conflicting_setup(self):
         self.git("switch", "-q", "-c", "dev")
         self.c1 = self.commit("docs: reword intro", {"docs/index.md": "intro, reworded on dev\n"})
@@ -330,10 +385,11 @@ class TestConflicts(Base):
         self.conflicting_setup()
         with open(os.path.join(self.wt, "docs", "index.md"), "w") as f:
             f.write("intro, reworded on both\n")
-        self.git("add", "docs/index.md", cwd=self.wt)
+        self.git("add", "--all", cwd=self.wt)
         self.slice("continue", "docs", "--from", "dev")
         self.assertEqual(self.subjects("main", "pathslice/docs/dev"), ["docs: reword intro", "docs: feature page"])
         self.assertEqual(self.show("pathslice/docs/dev", "docs/index.md"), "intro, reworded on both\n")
+        self.assertEqual(self.show("pathslice/docs/dev", "src/a.py"), "x=1\n")
         self.assertIn("Sliced-From: " + self.c1, self.git("log", "-1", "--format=%B", "pathslice/docs/dev~1"))
         self.assertFalse(os.path.exists(self.wt))
         self.assertEqual(self.state_files(), [])
@@ -511,25 +567,94 @@ class TestExportTracking(Base):
 
 
 class TestPush(Base):
-    def test_push_to_remote(self):
-        bare = os.path.join(self.tmp, "remote.git")
-        self.git("init", "-q", "--bare", bare)
-        self.git("remote", "add", "origin", bare)
-        self.git("push", "-q", "origin", "main")
+    def test_stale_checkout_cannot_replace_a_newer_export(self):
+        other = os.path.join(self.tmp, "other")
         self.standard_dev()
+        bare = self.remote()
+        self.slice("update", "docs", "--from", "dev", "--push")
+        self.git("clone", "-q", "--branch", "main", bare, other)
+        self.git("switch", "-q", "-c", "dev", "origin/dev", cwd=other)
+        with open(os.path.join(other, "docs", "later.md"), "w") as f:
+            f.write("another contributor's update\n")
+        self.git("add", "docs/later.md", cwd=other)
+        self.git("commit", "-q", "-m", "Later documentation", cwd=other)
+        self.slice("add", "docs", "docs/", "--base", "main", cwd=other)
+        self.slice("update", "docs", "--from", "dev", "--push", cwd=other)
+        newer = self.git("rev-parse", "pathslice/docs/dev", cwd=other).strip()
+        self.git("fetch", "-q", "origin")
+        p = self.slice("update", "docs", "--from", "dev", "--push", check=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(self.git("rev-parse", "pathslice/docs/dev", cwd=bare).strip(), newer)
+
+    def test_push_to_remote(self):
+        self.standard_dev()
+        bare = self.remote()
         out = self.slice("update", "docs", "--from", "dev", "--push").stdout
         self.assertIn("pushed pathslice/docs/dev to origin", out)
         self.assertEqual(self.git("rev-parse", "pathslice/docs/dev", cwd=bare).strip(), self.sha("pathslice/docs/dev"))
-        # nothing changed: no push at all, so the PR is not disturbed
         out = self.slice("update", "docs", "--from", "dev", "--push").stdout
         self.assertIn("already up to date on origin", out)
-        # rebuilt branch is force-pushed
         self.git("switch", "-q", "dev")
         self.commit("docs: later note", {"docs/later.md": "later\n"})
         self.git("switch", "-q", "main")
         out = self.slice("update", "docs", "--from", "dev", "--push").stdout
         self.assertIn("pushed pathslice/docs/dev", out)
         self.assertEqual(self.git("rev-parse", "pathslice/docs/dev", cwd=bare).strip(), self.sha("pathslice/docs/dev"))
+
+    def test_failed_publication_can_be_retried(self):
+        self.standard_dev()
+        bare = self.remote()
+        hook = os.path.join(bare, "hooks", "pre-receive")
+        with open(hook, "w") as f:
+            f.write("#!/bin/sh\nexit 1\n")
+        os.chmod(hook, 0o755)
+        p = self.slice("update", "docs", "--from", "dev", "--push", check=False)
+        self.assertNotEqual(p.returncode, 0)
+        head = self.sha("pathslice/docs/dev")
+        os.remove(hook)
+        p = self.slice("update", "docs", "--from", "dev", "--push")
+        self.assertIn("unchanged", p.stdout)
+        self.assertEqual(self.git("rev-parse", "pathslice/docs/dev", cwd=bare).strip(), head)
+
+
+class TestPullRequest(Base):
+    def test_updates_reuse_the_request_and_api_errors_are_reported(self):
+        self.standard_dev()
+        bare = self.remote()
+        gh = os.path.join(self.tmp, "gh")
+        calls = os.path.join(self.tmp, "gh-calls.jsonl")
+        self.env.update({"PATH": self.tmp + os.pathsep + self.env["PATH"], "GH_TEST_CALLS": calls})
+        with open(gh, "w") as f:
+            f.write("#!" + sys.executable + "\n" + textwrap.dedent('''
+                import json, os, pathlib, sys
+                args = sys.argv[1:]
+                calls = pathlib.Path(os.environ["GH_TEST_CALLS"])
+                with calls.open("a") as out:
+                    out.write(json.dumps(args) + "\\n")
+                if os.environ.get("GH_TEST_FAIL"):
+                    sys.stderr.write("service unavailable")
+                    sys.exit(1)
+                created = calls.with_suffix(".created")
+                if args[:2] == ["pr", "create"]:
+                    created.touch()
+                if created.exists():
+                    print("https://example.invalid/pull/1")
+                '''))
+        os.chmod(gh, 0o755)
+        self.slice("pr", "docs", "--from", "dev", "--draft")
+        self.git("switch", "-q", "dev")
+        self.commit("Later documentation", {"docs/later.md": "later\n"})
+        self.git("switch", "-q", "main")
+        p = self.slice("pr", "docs", "--from", "dev")
+        self.assertIn("existing PR updated", p.stdout)
+        self.assertEqual(self.git("show", "pathslice/docs/dev:docs/later.md", cwd=bare), "later\n")
+        self.env["GH_TEST_FAIL"] = "1"
+        p = self.slice("pr", "docs", "--from", "dev", check=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("service unavailable", p.stderr)
+        with open(calls) as f:
+            commands = [json.loads(line) for line in f]
+        self.assertEqual(sum(cmd[:2] == ["pr", "create"] for cmd in commands), 1)
 
 
 if __name__ == "__main__":

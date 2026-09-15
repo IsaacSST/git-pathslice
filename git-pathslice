@@ -25,7 +25,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 SHARED_FILE = ".gitpathslices"
 REF_ROOT = "refs/pathslices"
 BRANCH_ROOT = "pathslice"
@@ -60,6 +60,7 @@ def short(sha):
 
 
 # --------------------------------------------------------------------- repo
+
 
 class Repo:
     def __init__(self):
@@ -254,12 +255,14 @@ def read_record(repo, ref):
 def record_commit(repo, record, previous):
     # Parents retain the exported history even after source branches are rewritten.
     tree = repo.run("mktree", input="").strip()
-    parents = dict.fromkeys(p for p in (previous, record["source"], record.get("head")) if p)
+    parents = dict.fromkeys(p for p in (previous, record["source"], record.get("head"),
+                                      record["base"], record.get("checked_base")) if p)
     args = [arg for parent in parents for arg in ("-p", parent)]
     env = _committer_env(repo, record["source"])
     env.update({key.replace("COMMITTER", "AUTHOR"): value for key, value in list(env.items())})
     return repo.run("commit-tree", tree, *args, input=json.dumps(record, sort_keys=True),
                     env_extra=env).strip()
+
 
 def branch_name(name, frm) -> str:
     return "%s/%s/%s" % (BRANCH_ROOT, name, frm)
@@ -302,13 +305,14 @@ class Analysis:
     record_sha: Optional[str]
     record: dict
     landed: Set[str]
-    checkpoint: Optional[str]
+    checkpoints: List[str]
     landed_how: Optional[str]
     warnings: List[str]
     candidates: List[Candidate]
 
     def to_replay(self) -> List[Candidate]:
         return [c for c in self.candidates if c.decision == "replay"]
+
 
 def _describe(repo, shas: List[str], sl: Slice) -> List[Candidate]:
     if not shas:
@@ -382,14 +386,15 @@ def analyse(repo, sl: Slice, frm: str, base: Optional[str] = None, all_: bool = 
     record_sha, record = read_record(repo, record_ref)
     warnings = []
     landed = set()
-    checkpoint = record.get("checkpoint")
-    if checkpoint and not repo.is_ancestor(checkpoint, frm_sha):
-        warnings.append("%s was rewritten; the manual checkpoint is ignored" % frm)
-        checkpoint = None
+    checkpoints = record.get("checkpoints", [])
+    if any(not repo.is_ancestor(cp, frm_sha) for cp in checkpoints):
+        warnings.append("%s was rewritten; unreachable manual checkpoints are ignored" % frm)
+        checkpoints = [cp for cp in checkpoints if repo.is_ancestor(cp, frm_sha)]
 
     landed_how = None
     if record and repo.is_ancestor(record["base"], base_sha):
-        landed.update(record.get("landed", []))
+        if repo.is_ancestor(record.get("checked_base", record["base"]), base_sha):
+            landed.update(record.get("landed", []))
         head = record.get("head")
         if head and repo.is_ancestor(head, base_sha):
             landed_how = "merged"
@@ -399,10 +404,9 @@ def analyse(repo, sl: Slice, frm: str, base: Optional[str] = None, all_: bool = 
             landed.update(record["replayed"])
 
     landed.update(_provenance(repo, scope, base_sha, "^" + frm_sha))
-    revs = ["rev-list", "--reverse", "--no-merges", "--right-only", "--cherry-mark",
+    revs = ["rev-list", "--reverse", "--topo-order", "--no-merges", "--right-only", "--cherry-mark",
             base_sha + "..." + frm_sha]
-    if checkpoint:
-        revs.append("^" + checkpoint)
+    revs.extend("^" + cp for cp in checkpoints)
     marked = repo.run(*revs, "--", *sl.paths).split()
     equivalents = {line[1:] for line in marked if line.startswith("=")}
     cands = _describe(repo, [line[1:] for line in marked], sl)
@@ -417,24 +421,27 @@ def analyse(repo, sl: Slice, frm: str, base: Optional[str] = None, all_: bool = 
             c.decision = "skip (unmarked)"
     landed.update(equivalents)
     return Analysis(sl, frm, frm_sha, base, base_sha, branch, branch_sha, scope,
-                    record_ref, record_sha, record, landed, checkpoint, landed_how, warnings, cands)
+                    record_ref, record_sha, record, landed, checkpoints, landed_how, warnings, cands)
 
 # -------------------------------------------------------------------- build
+
 
 def _save_state(repo, st, create=False):
     path = state_path(repo, st["name"], st["frm"])
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    if create:
-        try:
-            with open(path, "x") as f:
-                json.dump(st, f)
-        except FileExistsError:
-            raise SliceError("an update is already in progress; run continue or abort")
-        return
-    tmp = path + ".tmp"
+    tmp = path + ".%d.tmp" % os.getpid()
     with open(tmp, "w") as f:
         json.dump(st, f, indent=1)
-    os.replace(tmp, path)
+    try:
+        if create:
+            os.link(tmp, path)
+        else:
+            os.replace(tmp, path)
+    except FileExistsError:
+        raise SliceError("an update is already in progress; run continue or abort")
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
 def _load_state(repo, name, frm) -> Optional[dict]:
@@ -459,14 +466,10 @@ def _remove_worktree(repo, wt):
     repo.try_run("worktree", "prune")
 
 
-def _prepare_worktree(repo, wt, base_sha, paths):
+def _prepare_worktree(repo, wt, base_sha):
     _remove_worktree(repo, wt)
     os.makedirs(os.path.dirname(wt), exist_ok=True)
-    repo.run("worktree", "add", "--detach", "--no-checkout", wt, base_sha)
-    repo.run("read-tree", "HEAD", cwd=wt)
-    listed = repo.run("ls-files", "-z", "--", *paths, cwd=wt, binary=True)
-    if listed:
-        repo.run("checkout-index", "-z", "--stdin", cwd=wt, input=listed)
+    repo.run("worktree", "add", "--detach", wt, base_sha)
 
 
 def _wt_head(repo, wt) -> str:
@@ -491,12 +494,7 @@ def _make_patch(repo, sha, paths, scope) -> bytes:
 
 
 def _committer_env(repo, src_sha) -> Dict[str, str]:
-    """Committer identity of the source commit.
-
-    Using it for the replayed commit makes a rebuild a pure function of
-    (base, source, paths): re-running update with nothing changed produces the
-    same commit ids, so there is no branch to force-push and no PR churn.
-    """
+    """Use the source committer identity and date for deterministic replay."""
     name, email, date = repo.run("log", "-1", "--format=%cn%x1f%ce%x1f%cI", src_sha).strip().split("\x1f")
     return {"GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": email, "GIT_COMMITTER_DATE": date}
 
@@ -519,20 +517,21 @@ def _run_queue(repo, st, quiet=False):
                     "conflict while replaying %s %s\n%s\n"
                     "  resolve it in: %s\n"
                     "  then run git pathslice continue %s --from %s\n"
-                    "  or use git pathslice skip/abort with the same arguments\n"
+                    "  or replace continue with skip or abort\n"
                     % (short(source), subject, err.strip(), wt, st["name"], st["frm"]))
                 return None
         st["queue"].pop(0)
         _save_state(repo, st)
     return _finalise(repo, st, quiet)
 
+
 def _finalise(repo, st, quiet=False):
     wt = st.get("worktree")
     head = st.get("keep_sha") or (_wt_head(repo, wt) if wt else st["base_sha"])
     record = {
-        "source": st["frm_sha"], "base": st["export_base"], "head": head,
+        "source": st["frm_sha"], "base": st["export_base"], "checked_base": st["base_sha"], "head": head,
         "replayed": _provenance(repo, st["scope"], head, "^" + st["export_base"]),
-        "landed": st["landed"], "checkpoint": st["checkpoint"],
+        "landed": st["landed"], "checkpoints": st["checkpoints"],
     }
     record_sha = st["record_before"]
     if record != st["record"]:
@@ -560,23 +559,38 @@ def _finalise(repo, st, quiet=False):
             sys.stderr.write("warning: %s no longer applies cleanly to %s; run --force-rebuild\n"
                              % (st["branch"], st["base"]))
     if st.get("push"):
-        _push(repo, st["push"], st["branch"], quiet)
+        _push(repo, st["push"], st["branch"], st["frm_sha"], st["scope"], quiet)
     return head
 
 
-def _push(repo, remote, branch, quiet=False):
-    ref = "refs/heads/%s" % branch
+def _push(repo, remote, branch, source, scope, quiet=False):
+    ref = "refs/heads/" + branch
     local = repo.rev(ref)
-    rc, out, _ = repo.try_run("ls-remote", remote, ref)
-    if rc == 0 and out.split() and out.split()[0] == local:
-        if not quiet:
-            print("%s is already up to date on %s" % (branch, remote))
-        return
-    rc, out, err = repo.try_run("push", "--force", remote, "%s:%s" % (ref, ref))
-    if rc != 0:
-        raise SliceError("push failed:\n" + err.strip())
+    rc, url, _ = repo.try_run("remote", "get-url", "--push", remote)
+    url = url.strip() if rc == 0 else remote
+    key = hashlib.sha256(json.dumps([url, ref]).encode()).hexdigest()
+    published_ref = REF_ROOT + "/published/" + key
+    published = repo.rev(published_ref)
+    expected = published or repo.rev("refs/remotes/%s/%s" % (remote, branch))
+    out = repo.run("ls-remote", url, ref).split()
+    actual = out[0] if out else None
+    if actual != local:
+        if actual and actual != expected:
+            raise SliceError("remote branch changed since the last accepted export; "
+                             "inspect and reconcile it before publishing")
+        if actual and not published and not repo.is_ancestor(actual, local):
+            mb = repo.run("merge-base", local, actual).strip()
+            sources = _provenance(repo, scope, actual, "^" + mb)
+            count = int(repo.run("rev-list", "--count", actual, "^" + mb))
+            if len(sources) != count or not all(repo.is_ancestor(src, source) for src in sources):
+                raise SliceError("the remote export does not match this scope and source history; "
+                                 "reconcile it before publishing")
+        repo.run("push", "--force-with-lease=%s:%s" % (ref, actual or ""), remote,
+                 "%s:%s" % (local, ref))
+    repo.run("update-ref", published_ref, local, published or "0" * len(local))
     if not quiet:
-        print("pushed %s to %s" % (branch, remote))
+        print("%s is already up to date on %s" % (branch, remote) if actual == local
+              else "pushed %s to %s" % (branch, remote))
 
 
 def _branch_encodes(repo, an: Analysis, to_replay) -> bool:
@@ -584,6 +598,7 @@ def _branch_encodes(repo, an: Analysis, to_replay) -> bool:
         return False
     mb = repo.run("merge-base", an.base_sha, an.branch_sha).strip()
     return _provenance(repo, an.scope, an.branch_sha, "^" + mb) == [c.sha for c in to_replay]
+
 
 def _conflicts_with_base(repo, an: Analysis) -> bool:
     if not repo.features()["merge_tree_write"]:
@@ -607,7 +622,7 @@ def do_update(repo, an: Analysis, push=None, quiet=False, force_rebuild=False):
         "branch": an.branch, "branch_before": an.branch_sha, "scope": an.scope,
         "paths": an.sl.paths, "worktree": None, "queue": [c.sha for c in to_replay],
         "record_ref": an.record_ref, "record_before": an.record_sha, "record": an.record,
-        "landed": sorted(an.landed), "checkpoint": an.checkpoint, "push": push,
+        "landed": sorted(an.landed), "checkpoints": an.checkpoints, "push": push,
     }
     if not force_rebuild and _branch_encodes(repo, an, to_replay):
         st["keep_sha"] = an.branch_sha
@@ -619,11 +634,12 @@ def do_update(repo, an: Analysis, push=None, quiet=False, force_rebuild=False):
     wt = worktree_path(repo, an.sl.name, an.frm)
     st["worktree"] = wt
     _save_state(repo, st, create=True)
-    _prepare_worktree(repo, wt, an.base_sha, an.sl.paths)
+    _prepare_worktree(repo, wt, an.base_sha)
     return _run_queue(repo, st, quiet)
 
 
 # ----------------------------------------------------------------- commands
+
 
 def resolve_from(repo, frm: Optional[str]) -> str:
     if frm:
@@ -695,8 +711,8 @@ def _print_analysis(repo, an: Analysis, verbose=True):
         print("  branch: %s ahead of %s%s%s" % (ahead, an.base, stale, merged))
     else:
         print("  branch: not built yet")
-    if an.checkpoint:
-        print("  manual checkpoint: %s" % short(an.checkpoint))
+    if an.checkpoints:
+        print("  manual checkpoints: %s" % ", ".join(map(short, an.checkpoints)))
     for w in an.warnings:
         print("  warning: %s" % w)
     n = len(an.to_replay())
@@ -743,7 +759,8 @@ def cmd_update(repo, a):
     return 0 if ok else 1
 
 
-def _resume(repo, a, mode) -> int:
+def cmd_resume(repo, a) -> int:
+    mode = a.cmd
     frm = resolve_from(repo, a.frm)
     st = _load_state(repo, a.name, frm)
     if not st:
@@ -769,18 +786,6 @@ def _resume(repo, a, mode) -> int:
     return 0 if _run_queue(repo, st, a.quiet) else 1
 
 
-def cmd_continue(repo, a):
-    return _resume(repo, a, "continue")
-
-
-def cmd_skip(repo, a):
-    return _resume(repo, a, "skip")
-
-
-def cmd_abort(repo, a):
-    return _resume(repo, a, "abort")
-
-
 def cmd_forget(repo, a):
     frm = resolve_from(repo, a.frm)
     root = state_root(a.name, frm)
@@ -800,47 +805,66 @@ def cmd_landed(repo, a):
     sha = repo.rev(a.rev)
     if not sha or not repo.is_ancestor(sha, frm):
         raise SliceError("%s must be an ancestor of %s" % (a.rev, frm))
+    if _load_state(repo, a.name, frm):
+        raise SliceError("an update is in progress; abort it before changing checkpoints")
     an = analyse(repo, get_slice(repo, a.name), frm)
+    if any(repo.is_ancestor(sha, cp) for cp in an.checkpoints):
+        print("%s is already covered by a manual checkpoint" % short(sha))
+        return 0
+    checkpoints = [cp for cp in an.checkpoints if not repo.is_ancestor(cp, sha)] + [sha]
     record = dict(an.record or {"source": an.frm_sha, "base": an.base_sha,
-                               "head": None, "replayed": [], "landed": []}, checkpoint=sha)
+                               "head": None, "replayed": [], "landed": []}, checkpoints=checkpoints)
     head = record_commit(repo, record, an.record_sha)
     repo.run("update-ref", an.record_ref, head, an.record_sha or "0" * len(head))
     print("slice %s from %s: everything up to %s is now treated as landed" % (a.name, frm, short(sha)))
 
+
+def github(repo, *args):
+    p = subprocess.run(["gh", *args], cwd=repo.top, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, text=True)
+    if p.returncode:
+        raise SliceError("gh failed: " + p.stderr.strip())
+    return p.stdout.strip()
+
+
 def cmd_pr(repo, a):
-    sl = get_slice(repo, a.name)
-    frm = resolve_from(repo, a.frm)
     if not shutil.which("gh"):
         raise SliceError("`gh` (GitHub CLI) is not installed")
+    repo.run("fetch", a.remote)
+    frm = resolve_from(repo, a.frm)
+    sl = get_slice(repo, a.name)
     an = analyse(repo, sl, frm, a.onto, a.all)
-    if not a.no_update:
-        if not do_update(repo, an, None, a.quiet, a.force_rebuild):
-            return 1
-        an = analyse(repo, sl, frm, a.onto, a.all)
-    if not an.branch_sha or not repo.rev("refs/heads/" + an.branch):
-        raise SliceError("branch %s does not exist" % an.branch)
-    _push(repo, a.remote, an.branch, a.quiet)
+    head = an.branch_sha if a.no_update else do_update(repo, an, quiet=a.quiet,
+                                                     force_rebuild=a.force_rebuild)
+    if not head:
+        if a.no_update:
+            raise SliceError("branch %s does not exist" % an.branch)
+        return 1
+    rc, _, err = repo.try_run("diff", "--quiet", an.base_sha, head)
+    if rc == 0:
+        print("no changes to publish")
+        return 0
+    if rc != 1:
+        raise SliceError(err.strip())
+    _push(repo, a.remote, an.branch, an.frm_sha, an.scope, a.quiet)
     base = an.base.split("/", 1)[1] if an.base.startswith(a.remote + "/") else an.base
-    p = subprocess.run(["gh", "pr", "list", "--head", an.branch, "--base", base, "--state", "open",
-                        "--json", "url", "--jq", ".[0].url"], cwd=repo.top, stdout=subprocess.PIPE,
-                       stderr=subprocess.PIPE, text=True)
-    url = p.stdout.strip()
+    url = github(repo, "pr", "list", "--head", an.branch, "--base", base, "--state", "open",
+                 "--json", "url", "--jq", ".[0].url")
     if url:
         print("existing PR updated: %s" % url)
         return 0
-    body_lines = ["Slice `%s` (%s) from `%s`, rebuilt by `git pathslice`." % (sl.name, " ".join(sl.paths), frm), ""]
-    for line in repo.run("log", "--reverse", "--format=- %s (%h)", an.base + ".." + an.branch).splitlines():
-        body_lines.append(line)
-    title = a.title or "%s: %s" % (sl.name, frm)
-    cmd = ["gh", "pr", "create", "--base", base, "--head", an.branch, "--title", title,
-           "--body", "\n".join(body_lines)]
+    commits = repo.run("log", "--reverse", "--format=- %s (%h)", an.base_sha + ".." + head).strip()
+    body = "Slice `%s` (%s) from `%s`.\n\n%s" % (sl.name, " ".join(sl.paths), frm, commits)
+    cmd = ["pr", "create", "--base", base, "--head", an.branch,
+           "--title", a.title or "%s: %s" % (sl.name, frm), "--body", body]
     if a.draft:
         cmd.append("--draft")
-    p = subprocess.run(cmd, cwd=repo.top)
-    return p.returncode
+    print(github(repo, *cmd))
+    return 0
 
 
 # --------------------------------------------------------------------- main
+
 
 def build_parser():
     p = argparse.ArgumentParser(prog="git pathslice", description=__doc__.split("\n\n")[0])
@@ -897,19 +921,19 @@ def build_parser():
     sp.add_argument("name")
     common(sp, branch=True, quiet=True)
     sp.add_argument("--push", nargs="?", const="origin", metavar="REMOTE",
-                    help="force-push the derived branch afterwards (default remote: origin)")
+                    help="publish the derived branch with an explicit lease (default remote: origin)")
     sp.add_argument("--force-rebuild", action="store_true",
                     help="rebuild onto the current base even if the branch already holds the right "
                          "commits (changes commit ids, so an open PR is force-pushed)")
     sp.set_defaults(func=cmd_update)
 
-    for name, fn, hlp in (("continue", cmd_continue, "resume an update after resolving a conflict"),
-                          ("skip", cmd_skip, "drop the conflicting commit and resume"),
-                          ("abort", cmd_abort, "abandon an update in progress")):
+    for name, hlp in (("continue", "resume an update after resolving a conflict"),
+                     ("skip", "drop the conflicting commit and resume"),
+                     ("abort", "abandon an update in progress")):
         sp = sub.add_parser(name, help=hlp)
         sp.add_argument("name")
         common(sp, onto=False, all_=False, quiet=True)
-        sp.set_defaults(func=fn)
+        sp.set_defaults(func=cmd_resume)
 
     sp = sub.add_parser("forget", help="drop the recorded sync state for a source branch")
     sp.add_argument("name")
