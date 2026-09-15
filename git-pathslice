@@ -231,9 +231,9 @@ def get_slice(repo, name) -> Slice:
     return sl
 
 
-def normalise_path(p: str) -> str:
-    prefix = os.environ.get("GIT_PREFIX", "")
-    if prefix and not p.startswith(":"):
+def normalise_path(repo, p: str) -> str:
+    prefix = os.environ.get("GIT_PREFIX") or os.path.relpath(os.getcwd(), repo.top)
+    if prefix not in ("", ".") and not p.startswith(":"):
         p = os.path.normpath(os.path.join(prefix, p))
     return p
 
@@ -662,7 +662,7 @@ def cmd_add(repo, a):
         raise SliceError("slice '%s' is already defined (%s); remove it first with `git pathslice rm`" % (a.name, where))
     key = "pathslice.%s." % a.name
     for p in a.paths:
-        repo.run("config", *target, "--add", key + "path", normalise_path(p))
+        repo.run("config", *target, "--add", key + "path", normalise_path(repo, p))
     if a.base:
         repo.run("config", *target, key + "base", a.base)
     if a.select != "all":

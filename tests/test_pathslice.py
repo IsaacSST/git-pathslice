@@ -465,7 +465,7 @@ class TestConfig(Base):
         self.slice("rm", "docs", "--shared")
         self.assertIn("no slices defined", self.slice("list").stdout)
 
-    def test_multiple_paths_and_subdir_add(self):
+    def test_multiple_paths(self):
         self.git("switch", "-q", "-c", "dev")
         self.commit("docs + readme", {"docs/index.md": "intro, clarified\n", "README.md": "readme\n", "src/a.py": "x=2\n"})
         self.git("switch", "-q", "main")
@@ -474,6 +474,16 @@ class TestConfig(Base):
         self.assertEqual(self.show("pathslice/docs/dev", "README.md"), "readme\n")
         self.assertEqual(self.show("pathslice/docs/dev", "docs/index.md"), "intro, clarified\n")
         self.assertEqual(self.show("pathslice/docs/dev", "src/a.py"), "x=1\n")
+
+    def test_add_from_subdirectory_through_git(self):
+        self.standard_dev()
+        self.env["PATH"] = os.path.dirname(SLICE) + os.pathsep + self.env["PATH"]
+        self.git("pathslice", "add", "page", "index.md", "--base", "main",
+                 cwd=os.path.join(self.repo, "docs"))
+        self.assertEqual(self.git("config", "pathslice.page.path").strip(), "docs/index.md")
+        self.slice("update", "page", "--from", "dev")
+        self.assertEqual(self.show("pathslice/page/dev", "docs/index.md"), "intro, clarified, more\n")
+        self.assertEqual(self.show("pathslice/page/dev", "docs/old.md"), "old page\n")
 
     def test_duplicate_add_refused(self):
         self.slice("add", "docs", "docs/")
