@@ -7,15 +7,15 @@ pathslice/<name>/<from> as <base> plus the commits on <from> that touch the
 slice's paths, each restricted to those paths, skipping whatever <base>
 already contains.  The result can be pull-requested into <base> on its own.
 
-State kept per (slice, source branch), as refs under refs/pathslices/:
-  .../source   the source tip at the last successful update
-  .../landed   the source commit up to which everything is known to be in base
+Export records are kept under refs/pathslices/, scoped to the slice's paths
+and destination. Each record identifies the commits exported and those known
+to have landed. Interrupted updates retain their temporary worktree.
 
-The derived branch is disposable and is rebuilt from base on every update.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -23,7 +23,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 VERSION = "0.1.0"
 SHARED_FILE = ".gitpathslices"
@@ -31,6 +31,7 @@ REF_ROOT = "refs/pathslices"
 BRANCH_ROOT = "pathslice"
 TRAILER = "Sliced-From"
 MARK_TRAILER = "Slice"
+SCOPE_TRAILER = "Pathslice"
 SELECTS = ("all", "pure", "marked")
 MIN_GIT = (2, 22)
 
@@ -236,10 +237,29 @@ def normalise_path(p: str) -> str:
     return p
 
 
-def state_refs(name, frm) -> Tuple[str, str]:
-    root = "%s/%s/%s" % (REF_ROOT, name, frm)
-    return root + "/source", root + "/landed"
+def state_root(name, frm):
+    return "%s/%s/%s" % (REF_ROOT, name, frm)
 
+
+def projection_scope(sl, base):
+    definition = json.dumps([sl.name, sl.paths, base], ensure_ascii=True)
+    return hashlib.sha256(definition.encode()).hexdigest()
+
+
+def read_record(repo, ref):
+    sha = repo.rev(ref)
+    return sha, json.loads(repo.run("log", "-1", "--format=%B", sha)) if sha else {}
+
+
+def record_commit(repo, record, previous):
+    # Parents retain the exported history even after source branches are rewritten.
+    tree = repo.run("mktree", input="").strip()
+    parents = dict.fromkeys(p for p in (previous, record["source"], record.get("head")) if p)
+    args = [arg for parent in parents for arg in ("-p", parent)]
+    env = _committer_env(repo, record["source"])
+    env.update({key.replace("COMMITTER", "AUTHOR"): value for key, value in list(env.items())})
+    return repo.run("commit-tree", tree, *args, input=json.dumps(record, sort_keys=True),
+                    env_extra=env).strip()
 
 def branch_name(name, frm) -> str:
     return "%s/%s/%s" % (BRANCH_ROOT, name, frm)
@@ -277,16 +297,18 @@ class Analysis:
     base_sha: str
     branch: str
     branch_sha: Optional[str]
-    source_prev: Optional[str]
-    old_landed: Optional[str]
-    new_landed: Optional[str]
+    scope: str
+    record_ref: str
+    record_sha: Optional[str]
+    record: dict
+    landed: Set[str]
+    checkpoint: Optional[str]
     landed_how: Optional[str]
     warnings: List[str]
     candidates: List[Candidate]
 
     def to_replay(self) -> List[Candidate]:
         return [c for c in self.candidates if c.decision == "replay"]
-
 
 def _describe(repo, shas: List[str], sl: Slice) -> List[Candidate]:
     if not shas:
@@ -323,38 +345,20 @@ def _describe(repo, shas: List[str], sl: Slice) -> List[Candidate]:
     return cands
 
 
-def _patch_ids(repo, revs: List[str], paths: List[str], stdin: Optional[str] = None) -> Dict[str, str]:
-    """Map commit -> stable patch id of its diff restricted to paths."""
-    args = ["log", "-p", "--no-merges", "--no-color", "--no-renames",
-            "--format=commit %H", *revs, "--", *paths]
-    rc, out, err = repo.try_run(*args, input=stdin, binary=True)
-    if rc != 0:
-        raise SliceError(err.strip())
-    if not out:
-        return {}
-    rc, ids, err = repo.try_run("patch-id", "--stable", input=out)
-    res = {}
-    for line in ids.splitlines():
-        parts = line.split()
-        if len(parts) == 2:
-            res[parts[1]] = parts[0]
-    return res
-
-
-def _sliced_from(repo, base_sha, scan_from) -> set:
-    out = repo.run("log", "--format=%(trailers:key=" + TRAILER + ",valueonly,separator=%x2c)",
-                   base_sha, "^" + scan_from)
-    found = set()
+def _provenance(repo, scope, *revs):
+    fmt = "%(trailers:key=" + SCOPE_TRAILER + ",valueonly,separator=%x2c)"
+    out = repo.run("log", "--reverse", "--format=" + fmt, *revs)
+    sources = []
     for line in out.splitlines():
-        for v in line.split(","):
-            v = v.strip()
-            if v:
-                found.add(v)
-    return found
+        for value in line.split(","):
+            parts = value.split()
+            if len(parts) == 2 and parts[0] == scope:
+                sources.append(parts[1])
+    return sources
 
 
-def _content_landed(repo, branch_sha, base_sha, source_prev, paths) -> bool:
-    shas = repo.run("rev-list", base_sha, "^" + source_prev, "--", *paths).split()
+def _content_landed(repo, branch_sha, base_sha, previous_base, paths) -> bool:
+    shas = repo.run("rev-list", base_sha, "^" + previous_base, "--", *paths).split()
     for s in shas:
         rc, _, _ = repo.try_run("diff", "--quiet", s, branch_sha, "--", *paths)
         if rc == 0:
@@ -365,74 +369,68 @@ def _content_landed(repo, branch_sha, base_sha, source_prev, paths) -> bool:
 def analyse(repo, sl: Slice, frm: str, base: Optional[str] = None, all_: bool = False,
             branch: Optional[str] = None) -> Analysis:
     base = base or sl.base
-    base_sha = repo.rev(base)
-    if not base_sha:
-        raise SliceError("base '%s' is not a commit" % base)
-    frm_sha = repo.rev(frm)
-    if not frm_sha:
-        raise SliceError("'%s' is not a commit" % frm)
+    base_sha, frm_sha = repo.rev(base), repo.rev(frm)
+    if not base_sha or not frm_sha:
+        raise SliceError("source and base must both name commits")
     if frm_sha == base_sha:
         raise SliceError("'%s' and base '%s' are the same commit" % (frm, base))
     branch = branch or branch_name(sl.name, frm)
     repo.check_ref_format(branch)
     branch_sha = repo.rev("refs/heads/" + branch)
-    source_ref, landed_ref = state_refs(sl.name, frm)
-    source_prev = repo.rev(source_ref)
-    old_landed = repo.rev(landed_ref)
-    warnings: List[str] = []
-
-    new_landed = old_landed
-    if old_landed and not repo.is_ancestor(old_landed, frm_sha):
-        warnings.append("%s was rewritten since the last update; the recorded landed point is ignored "
-                        "and patch ids are relied on instead" % frm)
-        new_landed = None
+    scope = projection_scope(sl, base)
+    record_ref = state_root(sl.name, frm) + "/exports/" + scope
+    record_sha, record = read_record(repo, record_ref)
+    warnings = []
+    landed = set()
+    checkpoint = record.get("checkpoint")
+    if checkpoint and not repo.is_ancestor(checkpoint, frm_sha):
+        warnings.append("%s was rewritten; the manual checkpoint is ignored" % frm)
+        checkpoint = None
 
     landed_how = None
-    if branch_sha and source_prev:
-        if repo.is_ancestor(branch_sha, base_sha):
+    if record and repo.is_ancestor(record["base"], base_sha):
+        landed.update(record.get("landed", []))
+        head = record.get("head")
+        if head and repo.is_ancestor(head, base_sha):
             landed_how = "merged"
-        elif _content_landed(repo, branch_sha, base_sha, source_prev, sl.paths):
+        elif head and _content_landed(repo, head, base_sha, record["base"], sl.paths):
             landed_how = "content"
-        if landed_how and repo.is_ancestor(source_prev, frm_sha):
-            if new_landed is None or repo.is_ancestor(new_landed, source_prev):
-                new_landed = source_prev
+        if landed_how:
+            landed.update(record["replayed"])
 
-    revs = ["rev-list", "--reverse", "--no-merges", frm_sha, "^" + base_sha]
-    if new_landed:
-        revs.append("^" + new_landed)
-    shas = repo.run(*revs, "--", *sl.paths).split()
-    cands = _describe(repo, shas, sl)
-
-    if cands:
-        scan_from = source_prev if (source_prev and repo.is_ancestor(source_prev, frm_sha)) else frm_sha
-        trailers = _sliced_from(repo, base_sha, scan_from)
-        base_ids = set(_patch_ids(repo, [base_sha, "^" + scan_from], sl.paths).values())
-        cand_ids = _patch_ids(repo, ["--no-walk=unsorted", "--stdin"], sl.paths,
-                              stdin="\n".join(shas) + "\n")
-        for c in cands:
-            if c.sha in trailers:
-                c.decision = "landed (trailer)"
-            elif cand_ids.get(c.sha) and cand_ids[c.sha] in base_ids:
-                c.decision = "landed (patch-id)"
-            elif not all_ and sl.select == "pure" and not c.pure:
-                c.decision = "skip (mixed)"
-            elif not all_ and sl.select == "marked" and not c.marked:
-                c.decision = "skip (unmarked)"
-        for c in cands:
-            if c.decision.startswith("landed"):
-                new_landed = c.sha
-            else:
-                break
-
-    return Analysis(sl, frm, frm_sha, base, base_sha, branch, branch_sha, source_prev,
-                    old_landed, new_landed, landed_how, warnings, cands)
-
+    landed.update(_provenance(repo, scope, base_sha, "^" + frm_sha))
+    revs = ["rev-list", "--reverse", "--no-merges", "--right-only", "--cherry-mark",
+            base_sha + "..." + frm_sha]
+    if checkpoint:
+        revs.append("^" + checkpoint)
+    marked = repo.run(*revs, "--", *sl.paths).split()
+    equivalents = {line[1:] for line in marked if line.startswith("=")}
+    cands = _describe(repo, [line[1:] for line in marked], sl)
+    for c in cands:
+        if c.sha in landed:
+            c.decision = "landed (trailer)"
+        elif c.sha in equivalents:
+            c.decision = "landed (patch-id)"
+        elif not all_ and sl.select == "pure" and not c.pure:
+            c.decision = "skip (mixed)"
+        elif not all_ and sl.select == "marked" and not c.marked:
+            c.decision = "skip (unmarked)"
+    landed.update(equivalents)
+    return Analysis(sl, frm, frm_sha, base, base_sha, branch, branch_sha, scope,
+                    record_ref, record_sha, record, landed, checkpoint, landed_how, warnings, cands)
 
 # -------------------------------------------------------------------- build
 
-def _save_state(repo, st):
+def _save_state(repo, st, create=False):
     path = state_path(repo, st["name"], st["frm"])
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    if create:
+        try:
+            with open(path, "x") as f:
+                json.dump(st, f)
+        except FileExistsError:
+            raise SliceError("an update is already in progress; run continue or abort")
+        return
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(st, f, indent=1)
@@ -480,12 +478,16 @@ def _am_in_progress(repo, wt) -> bool:
     return os.path.isdir(os.path.join(wt, p) if not os.path.isabs(p) else p)
 
 
-def _make_patch(repo, sha, paths) -> bytes:
-    return repo.run("-c", "format.signoff=false", "-c", "diff.noprefix=false",
+def _make_patch(repo, sha, paths, scope) -> bytes:
+    patch = repo.run("-c", "format.signoff=false", "-c", "diff.noprefix=false",
                     "-c", "diff.mnemonicprefix=false", "-c", "format.useautobase=false",
                     "format-patch", "-1", "-k", "--stdout", "--binary", "--full-index",
                     "--no-signature", "--no-thread", "--no-cover-letter", "--no-notes",
                     "--no-numbered", sha, "--", *paths, binary=True)
+    return repo.run("interpret-trailers", "--if-exists", "addIfDifferent",
+                    "--trailer", "%s: %s" % (TRAILER, sha),
+                    "--trailer", "%s: %s %s" % (SCOPE_TRAILER, scope, sha),
+                    input=patch, binary=True)
 
 
 def _committer_env(repo, src_sha) -> Dict[str, str]:
@@ -499,99 +501,67 @@ def _committer_env(repo, src_sha) -> Dict[str, str]:
     return {"GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": email, "GIT_COMMITTER_DATE": date}
 
 
-def _add_trailer(repo, wt, src_sha):
-    msg = repo.run("log", "-1", "--format=%B", cwd=wt, binary=True)
-    msg = repo.run("interpret-trailers", "--if-exists", "addIfDifferent",
-                   "--trailer", "%s: %s" % (TRAILER, src_sha), cwd=wt, input=msg, binary=True)
-    repo.run("commit", "--amend", "--no-verify", "--cleanup=verbatim", "-F", "-", cwd=wt,
-             input=msg, env_extra=_committer_env(repo, src_sha))
-
-
-def _finish_current(repo, st):
-    wt = st["worktree"]
-    head = _wt_head(repo, wt)
-    cur = st["current"]
-    if head == st["head_before"]:
-        st["already"].append(cur)
-    else:
-        _add_trailer(repo, wt, cur)
-        st["replayed"].append([cur, _wt_head(repo, wt)])
-    st["current"] = None
-    st["head_before"] = None
-    _save_state(repo, st)
-
-
-def _run_queue(repo, st, quiet=False) -> bool:
+def _run_queue(repo, st, quiet=False):
     wt = st["worktree"]
     am = ["am", "-3", "-k"]
     if repo.features()["am_no_verify"]:
         am.append("--no-verify")
     while st["queue"]:
-        st["current"] = st["queue"].pop(0)
-        st["head_before"] = _wt_head(repo, wt)
+        source = st["queue"][0]
+        # A successful am may precede an interrupted journal write.
+        if source not in _provenance(repo, st["scope"], "-1", _wt_head(repo, wt)):
+            patch = _make_patch(repo, source, st["paths"], st["scope"])
+            rc, _, err = repo.try_run(*am, cwd=wt, input=patch,
+                                     env_extra=_committer_env(repo, source))
+            if rc != 0:
+                subject = repo.run("log", "-1", "--format=%s", source).strip()
+                sys.stderr.write(
+                    "conflict while replaying %s %s\n%s\n"
+                    "  resolve it in: %s\n"
+                    "  then run git pathslice continue %s --from %s\n"
+                    "  or use git pathslice skip/abort with the same arguments\n"
+                    % (short(source), subject, err.strip(), wt, st["name"], st["frm"]))
+                return None
+        st["queue"].pop(0)
         _save_state(repo, st)
-        patch = _make_patch(repo, st["current"], st["paths"])
-        if b"\ndiff --git " not in patch:
-            _finish_current(repo, st)
-            continue
-        rc, _, err = repo.try_run(*am, cwd=wt, input=patch)
-        if rc != 0:
-            _save_state(repo, st)
-            subject = repo.run("log", "-1", "--format=%s", st["current"]).strip()
-            sys.stderr.write(
-                "conflict while replaying %s %s\n"
-                "  resolve it in:  %s\n"
-                "  then run:       git pathslice continue %s --from %s\n"
-                "  or:             git pathslice skip %s --from %s   /   git pathslice abort %s --from %s\n"
-                % (short(st["current"]), subject, wt, st["name"], st["frm"],
-                   st["name"], st["frm"], st["name"], st["frm"]))
-            return False
-        _finish_current(repo, st)
-    _finalize(repo, st, quiet)
-    return True
+    return _finalise(repo, st, quiet)
 
-
-def _finalize(repo, st, quiet=False):
+def _finalise(repo, st, quiet=False):
     wt = st.get("worktree")
-    new_sha = st.get("keep_sha") or (_wt_head(repo, wt) if wt else st["base_sha"])
-    _set_branch(repo, st["branch"], new_sha)
-    source_ref, landed_ref = state_refs(st["name"], st["frm"])
-    repo.update_ref(source_ref, st["frm_sha"])
-    if st.get("new_landed"):
-        repo.update_ref(landed_ref, st["new_landed"])
+    head = st.get("keep_sha") or (_wt_head(repo, wt) if wt else st["base_sha"])
+    record = {
+        "source": st["frm_sha"], "base": st["export_base"], "head": head,
+        "replayed": _provenance(repo, st["scope"], head, "^" + st["export_base"]),
+        "landed": st["landed"], "checkpoint": st["checkpoint"],
+    }
+    record_sha = st["record_before"]
+    if record != st["record"]:
+        record_sha = record_commit(repo, record, record_sha)
+    at = repo.branch_checked_out_at(st["branch"])
+    if at:
+        raise SliceError("branch %s is checked out at %s; detach it first" % (st["branch"], at))
+    zero = "0" * len(head)
+    # A prior attempt may have committed the refs before removing its journal.
+    if repo.rev(st["record_ref"]) == record_sha and repo.rev("refs/heads/" + st["branch"]) == head:
+        st["record_before"], st["branch_before"] = record_sha, head
+    repo.run("update-ref", "--stdin", input=
+             "update refs/heads/%s %s %s\nupdate %s %s %s\n" % (
+                 st["branch"], head, st["branch_before"] or zero,
+                 st["record_ref"], record_sha, st["record_before"] or zero))
     if wt:
         _remove_worktree(repo, wt)
     _drop_state(repo, st["name"], st["frm"])
-    if not quiet and st.get("keep_sha"):
-        n = repo.run("rev-list", "--count", new_sha, "^" + repo.run(
-            "merge-base", st["base_sha"], new_sha).strip()).strip()
-        print("%s: unchanged, %s commit%s (%s has moved on but the slice has not; "
-              "--force-rebuild to rebase it)" % (st["branch"], n, "" if n == "1" else "s", st["base"]))
-    elif not quiet:
-        n = len(st["replayed"])
-        ahead = repo.run("rev-list", "--count", st["base_sha"] + ".." + new_sha).strip()
-        extra = []
-        if st["already"]:
-            extra.append("%d already in %s" % (len(st["already"]), st["base"]))
-        if st.get("skipped"):
-            extra.append("%d skipped" % st["skipped"])
-        print("%s: %s + %s commit%s (%d replayed%s)" % (
-            st["branch"], st["base"], ahead, "" if ahead == "1" else "s", n,
-            ", " + ", ".join(extra) if extra else ""))
-        for src, new in st["replayed"]:
-            print("  %s  %s" % (short(new), repo.run("log", "-1", "--format=%s", new).strip()))
-    if not quiet and st.get("conflicts_with_base"):
-        sys.stderr.write("warning: %s no longer applies cleanly to %s; run --force-rebuild "
-                         "to rebase it and resolve the conflict\n" % (st["branch"], st["base"]))
+    if not quiet:
+        if st.get("keep_sha"):
+            print("%s: unchanged; use --force-rebuild to rebase onto %s" % (st["branch"], st["base"]))
+        else:
+            print("%s: %s + %d commits" % (st["branch"], st["base"], len(record["replayed"])))
+        if st.get("conflicts_with_base"):
+            sys.stderr.write("warning: %s no longer applies cleanly to %s; run --force-rebuild\n"
+                             % (st["branch"], st["base"]))
     if st.get("push"):
         _push(repo, st["push"], st["branch"], quiet)
-
-
-def _set_branch(repo, branch, sha):
-    at = repo.branch_checked_out_at(branch)
-    if at:
-        raise SliceError("branch %s is checked out at %s; detach it first" % (branch, at))
-    repo.run("branch", "-f", branch, sha)
+    return head
 
 
 def _push(repo, remote, branch, quiet=False):
@@ -610,20 +580,10 @@ def _push(repo, remote, branch, quiet=False):
 
 
 def _branch_encodes(repo, an: Analysis, to_replay) -> bool:
-    """True if the existing derived branch already holds exactly these commits.
-
-    When base moves but the slice's own commits do not, rebuilding would change
-    every commit id and force-push, which marks a pull request's review comments
-    outdated for no reason.  A branch that already encodes the right commits is
-    left exactly as it is.
-    """
     if not an.branch_sha or not to_replay:
         return False
     mb = repo.run("merge-base", an.base_sha, an.branch_sha).strip()
-    out = repo.run("log", "--reverse", "--format=%(trailers:key=" + TRAILER + ",valueonly,separator=%x2c)",
-                   an.branch_sha, "^" + mb)
-    return [l.strip() for l in out.splitlines()] == [c.sha for c in to_replay]
-
+    return _provenance(repo, an.scope, an.branch_sha, "^" + mb) == [c.sha for c in to_replay]
 
 def _conflicts_with_base(repo, an: Analysis) -> bool:
     if not repo.features()["merge_tree_write"]:
@@ -632,36 +592,34 @@ def _conflicts_with_base(repo, an: Analysis) -> bool:
     return rc == 1
 
 
-def do_update(repo, sl, an: Analysis, push: Optional[str], quiet: bool, force_rebuild: bool = False) -> bool:
-    if _load_state(repo, sl.name, an.frm):
-        raise SliceError("an update of slice '%s' from %s is in progress; run `git pathslice continue` "
-                         "or `git pathslice abort`" % (sl.name, an.frm))
+def do_update(repo, an: Analysis, push=None, quiet=False, force_rebuild=False):
+    if _load_state(repo, an.sl.name, an.frm):
+        raise SliceError("an update of slice '%s' is in progress; run continue or abort" % an.sl.name)
     at = repo.branch_checked_out_at(an.branch)
     if at:
         raise SliceError("branch %s is checked out at %s; detach it first" % (an.branch, at))
-    for w in an.warnings:
-        sys.stderr.write("warning: %s\n" % w)
+    for warning in an.warnings:
+        sys.stderr.write("warning: %s\n" % warning)
     to_replay = an.to_replay()
     st = {
-        "name": sl.name, "frm": an.frm, "frm_sha": an.frm_sha, "base": an.base, "base_sha": an.base_sha,
-        "branch": an.branch, "paths": sl.paths, "worktree": None,
-        "queue": [c.sha for c in to_replay], "current": None, "head_before": None,
-        "replayed": [], "already": [c.sha for c in an.candidates if c.decision.startswith("landed")],
-        "skipped": sum(1 for c in an.candidates if c.decision.startswith("skip")),
-        "new_landed": an.new_landed, "push": push,
+        "name": an.sl.name, "frm": an.frm, "frm_sha": an.frm_sha,
+        "base": an.base, "base_sha": an.base_sha, "export_base": an.base_sha,
+        "branch": an.branch, "branch_before": an.branch_sha, "scope": an.scope,
+        "paths": an.sl.paths, "worktree": None, "queue": [c.sha for c in to_replay],
+        "record_ref": an.record_ref, "record_before": an.record_sha, "record": an.record,
+        "landed": sorted(an.landed), "checkpoint": an.checkpoint, "push": push,
     }
     if not force_rebuild and _branch_encodes(repo, an, to_replay):
         st["keep_sha"] = an.branch_sha
+        st["export_base"] = repo.run("merge-base", an.base_sha, an.branch_sha).strip()
         st["conflicts_with_base"] = _conflicts_with_base(repo, an)
-        _finalize(repo, st, quiet)
-        return True
+        return _finalise(repo, st, quiet)
     if not to_replay:
-        _finalize(repo, st, quiet)
-        return True
-    wt = worktree_path(repo, sl.name, an.frm)
-    _prepare_worktree(repo, wt, an.base_sha, sl.paths)
+        return _finalise(repo, st, quiet)
+    wt = worktree_path(repo, an.sl.name, an.frm)
     st["worktree"] = wt
-    _save_state(repo, st)
+    _save_state(repo, st, create=True)
+    _prepare_worktree(repo, wt, an.base_sha, an.sl.paths)
     return _run_queue(repo, st, quiet)
 
 
@@ -732,14 +690,13 @@ def _print_analysis(repo, an: Analysis, verbose=True):
     print("slice %s: %s -> %s  (branch %s)" % (an.sl.name, an.frm, an.base, an.branch))
     if an.branch_sha:
         ahead = repo.run("rev-list", "--count", an.base_sha + ".." + an.branch_sha).strip()
-        stale = "" if an.source_prev == an.frm_sha else ", built from an older %s" % an.frm
+        stale = "" if an.record.get("source") == an.frm_sha else ", built from an older %s" % an.frm
         merged = ", merged into %s" % an.base if an.landed_how == "merged" else ""
         print("  branch: %s ahead of %s%s%s" % (ahead, an.base, stale, merged))
     else:
         print("  branch: not built yet")
-    if an.new_landed:
-        print("  landed up to: %s%s" % (short(an.new_landed),
-                                        "" if an.new_landed == an.old_landed else " (advanced by this run)"))
+    if an.checkpoint:
+        print("  manual checkpoint: %s" % short(an.checkpoint))
     for w in an.warnings:
         print("  warning: %s" % w)
     n = len(an.to_replay())
@@ -782,7 +739,7 @@ def cmd_update(repo, a):
     sl = get_slice(repo, a.name)
     frm = resolve_from(repo, a.frm)
     an = analyse(repo, sl, frm, a.onto, a.all, a.branch)
-    ok = do_update(repo, sl, an, a.push, a.quiet, a.force_rebuild)
+    ok = do_update(repo, an, a.push, a.quiet, a.force_rebuild)
     return 0 if ok else 1
 
 
@@ -793,29 +750,22 @@ def _resume(repo, a, mode) -> int:
         raise SliceError("no update of slice '%s' from %s is in progress" % (a.name, frm))
     wt = st["worktree"]
     if mode == "abort":
-        if wt and _am_in_progress(repo, wt):
-            repo.try_run("am", "--abort", cwd=wt)
-        if wt:
-            _remove_worktree(repo, wt)
+        if repo.worktree_registered(wt) and _am_in_progress(repo, wt):
+            repo.run("am", "--abort", cwd=wt)
+        _remove_worktree(repo, wt)
         _drop_state(repo, a.name, frm)
         print("aborted; %s left untouched" % st["branch"])
         return 0
-    if st["current"]:
+    if "scope" not in st:
+        raise SliceError("this update uses the old state format; abort it and run update again")
+    if _am_in_progress(repo, wt):
+        repo.run("am", "--" + mode, cwd=wt,
+                 env_extra=_committer_env(repo, st["queue"][0]))
         if mode == "skip":
-            if _am_in_progress(repo, wt):
-                repo.try_run("am", "--skip", cwd=wt)
-            st["skipped"] = st.get("skipped", 0) + 1
-            st["current"] = None
+            st["queue"].pop(0)
             _save_state(repo, st)
-        else:
-            if _am_in_progress(repo, wt):
-                rc, out, err = repo.try_run("am", "--continue", cwd=wt)
-                if rc != 0:
-                    sys.stderr.write(err.strip() + "\n")
-                    sys.stderr.write("resolve the conflict in %s (git add the files), then run "
-                                     "git pathslice continue again\n" % wt)
-                    return 1
-            _finish_current(repo, st)
+    elif mode == "skip":
+        raise SliceError("no patch is awaiting resolution; use continue")
     return 0 if _run_queue(repo, st, a.quiet) else 1
 
 
@@ -833,8 +783,11 @@ def cmd_abort(repo, a):
 
 def cmd_forget(repo, a):
     frm = resolve_from(repo, a.frm)
-    for ref in state_refs(a.name, frm):
+    root = state_root(a.name, frm)
+    for ref in repo.run("for-each-ref", "--format=%(refname)", root + "/exports/").splitlines():
         repo.delete_ref(ref)
+    for suffix in ("/source", "/landed"):
+        repo.delete_ref(root + suffix)
     if a.branch:
         br = branch_name(a.name, frm)
         if repo.rev("refs/heads/" + br):
@@ -845,14 +798,14 @@ def cmd_forget(repo, a):
 def cmd_landed(repo, a):
     frm = resolve_from(repo, a.frm)
     sha = repo.rev(a.rev)
-    if not sha:
-        raise SliceError("'%s' is not a commit" % a.rev)
-    if not repo.is_ancestor(sha, frm):
-        raise SliceError("%s is not an ancestor of %s" % (a.rev, frm))
-    _, landed_ref = state_refs(a.name, frm)
-    repo.update_ref(landed_ref, sha)
+    if not sha or not repo.is_ancestor(sha, frm):
+        raise SliceError("%s must be an ancestor of %s" % (a.rev, frm))
+    an = analyse(repo, get_slice(repo, a.name), frm)
+    record = dict(an.record or {"source": an.frm_sha, "base": an.base_sha,
+                               "head": None, "replayed": [], "landed": []}, checkpoint=sha)
+    head = record_commit(repo, record, an.record_sha)
+    repo.run("update-ref", an.record_ref, head, an.record_sha or "0" * len(head))
     print("slice %s from %s: everything up to %s is now treated as landed" % (a.name, frm, short(sha)))
-
 
 def cmd_pr(repo, a):
     sl = get_slice(repo, a.name)
@@ -861,7 +814,7 @@ def cmd_pr(repo, a):
         raise SliceError("`gh` (GitHub CLI) is not installed")
     an = analyse(repo, sl, frm, a.onto, a.all)
     if not a.no_update:
-        if not do_update(repo, sl, an, None, a.quiet, a.force_rebuild):
+        if not do_update(repo, an, None, a.quiet, a.force_rebuild):
             return 1
         an = analyse(repo, sl, frm, a.onto, a.all)
     if not an.branch_sha or not repo.rev("refs/heads/" + an.branch):

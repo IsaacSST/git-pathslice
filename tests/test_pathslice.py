@@ -122,8 +122,10 @@ class TestUpdate(Base):
         self.assert_standard_result()
         body = self.git("log", "-1", "--format=%B", "pathslice/docs/dev~1")
         self.assertIn("Sliced-From: " + self.d1, body)
-        self.assertEqual(self.git("log", "-1", "--format=%an", "pathslice/docs/dev~1").strip(), "Other")
-        self.assertEqual(self.sha("refs/pathslices/docs/dev/source"), self.d3)
+        metadata = "--format=%an%n%ae%n%aI%n%cn%n%ce%n%cI"
+        for original, exported in [(self.d1, "pathslice/docs/dev~1"), (self.d2, "pathslice/docs/dev")]:
+            self.assertEqual(self.git("log", "-1", metadata, original),
+                             self.git("log", "-1", metadata, exported))
         self.assertEqual(len(self.worktrees()), 1)
         self.assertEqual(self.state_files(), [])
         # the user's checkout is untouched
@@ -224,7 +226,6 @@ class TestLanding(Base):
         self.slice("update", "docs", "--from", "dev")
         self.git("merge", "-q", "--no-ff", "--no-edit", "pathslice/docs/dev")
         self.land_then_continue()
-        self.assertEqual(self.sha("refs/pathslices/docs/dev/landed"), self.d3)
 
     def test_merge_commit_without_state_uses_trailers(self):
         self.standard_dev()
@@ -473,6 +474,40 @@ class TestStability(Base):
         p = self.slice("update", "docs", "--from", "dev")
         self.assertIn("unchanged", p.stdout)
         self.assertIn("no longer applies cleanly", p.stderr)
+
+
+class TestExportTracking(Base):
+    def test_landing_one_slice_does_not_suppress_another(self):
+        self.git("switch", "-q", "-c", "dev")
+        self.commit("Two documents", {"docs/index.md": "new intro\n", "docs/old.md": "new page\n"})
+        self.git("switch", "-q", "main")
+        self.slice("add", "a", "docs/index.md", "--base", "main")
+        self.slice("add", "b", "docs/old.md", "--base", "main")
+        self.slice("update", "a", "--from", "dev")
+        self.git("merge", "-q", "--no-ff", "--no-edit", "pathslice/a/dev")
+        self.slice("update", "b", "--from", "dev")
+        self.assertEqual(self.show("pathslice/b/dev", "docs/old.md"), "new page\n")
+
+    def test_expanding_paths_exports_the_rest_of_a_mixed_commit(self):
+        self.git("switch", "-q", "-c", "dev")
+        self.commit("Two documents", {"docs/index.md": "new intro\n", "docs/old.md": "new page\n"})
+        self.git("switch", "-q", "main")
+        self.slice("add", "docs", "docs/index.md", "--base", "main")
+        self.slice("update", "docs", "--from", "dev")
+        self.git("config", "--add", "pathslice.docs.path", "docs/old.md")
+        self.slice("update", "docs", "--from", "dev")
+        self.assertEqual(self.show("pathslice/docs/dev", "docs/old.md"), "new page\n")
+
+    def test_filtered_export_leaves_excluded_commits_pending_after_landing(self):
+        self.standard_dev()
+        self.git("config", "pathslice.docs.select", "pure")
+        self.slice("update", "docs", "--from", "dev")
+        self.git("merge", "-q", "--squash", "pathslice/docs/dev")
+        self.git("commit", "-q", "-m", "Land selected documentation")
+        self.slice("update", "docs", "--from", "dev", "--all")
+        self.assertEqual(self.show("pathslice/docs/dev", "docs/index.md"), "intro, clarified, more\n")
+        self.assertTrue(self.exists("pathslice/docs/dev", "docs/feature.md"))
+        self.assertEqual(self.show("pathslice/docs/dev", "src/a.py"), "x=1\n")
 
 
 class TestPush(Base):
