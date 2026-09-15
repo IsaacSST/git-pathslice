@@ -86,6 +86,13 @@ rebuild an open PR; `--force-rebuild` requests this and rewrites the export
 commits. Conflicts with the destination are reported when Git supports the
 check. Identical replay inputs reproduce the same hashes.
 
+Slice branches are recorded locally. Existing branches are accepted only
+when recorded for the same slice and source, with no subsequent changes
+outside the tool. Source and destination branches cannot be export targets.
+These checks also apply to `--force-rebuild` and `publish --no-update`.
+For a collision, rename the ordinary branch or use `update --branch NAME`.
+An ordinary branch created from a slice remains independent.
+
 ## Selection
 
 Set the rule with `add --select RULE`:
@@ -144,12 +151,15 @@ branch. If `publish` stopped on a conflict, rerun it after `continue` to publish
 Pushes use an explicit lease against the last accepted export. Unexpected
 remote changes are refused even after a background fetch. A new checkout
 validates the remote export's scope and source history before replacing it.
-Failed pushes leave the local export available for retry.
+Unrecognised remote branches are refused. Failed pushes leave the local
+export available for retry.
 
 ## Other commands
 
 `list` and `status` inspect slices; `rm` removes definitions. `forget` removes
-export records and checkpoints but retains publication leases.
+landing records and checkpoints but retains branch ownership and publication
+leases. `forget --branch` also deletes the default slice branch and its
+ownership record, provided the branch is unchanged and not checked out.
 Use `git pathslice COMMAND -h` for options.
 
 ## Limits and tests

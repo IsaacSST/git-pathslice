@@ -199,7 +199,105 @@ class TestUpdate(Base):
     def test_custom_branch_name(self):
         self.standard_dev()
         self.slice("update", "docs", "--from", "dev", "--branch", "docs/dev")
+        self.slice("update", "docs", "--from", "dev", "--branch", "docs/dev")
         self.assert_standard_result("docs/dev")
+
+
+class TestBranchProtection(Base):
+    def test_unrecorded_branches_are_preserved(self):
+        self.standard_dev()
+        for branch in ("pathslice/docs/dev", "review/docs"):
+            with self.subTest(branch=branch):
+                self.git("switch", "-q", "-c", branch)
+                head = self.commit("Independent work", {"notes/work.md": "keep this\n"})
+                self.git("switch", "-q", "main")
+                p = self.slice("update", "docs", "--from", "dev", "--branch", branch,
+                               "--force-rebuild", check=False)
+                self.assertNotEqual(p.returncode, 0)
+                self.assertIn("not recorded as an export", p.stderr)
+                self.assertEqual(self.sha(branch), head)
+        p = self.slice("forget", "docs", "--from", "dev", "--branch", check=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(self.show("pathslice/docs/dev", "notes/work.md"), "keep this\n")
+        self.assertEqual(self.state_files(), [])
+        self.assertEqual(len(self.worktrees()), 1)
+
+    def test_source_and_destination_names_are_refused(self):
+        self.standard_dev()
+        self.remote()
+        self.git("switch", "-q", "--detach")
+        for source, base, branch in (("refs/heads/dev", "main", "dev"),
+                                     ("origin/dev", "main", "dev"),
+                                     ("dev", "origin/main", "main")):
+            with self.subTest(source=source, base=base):
+                head = self.sha(branch)
+                p = self.slice("update", "docs", "--from", source, "--onto", base,
+                               "--branch", branch, check=False)
+                self.assertNotEqual(p.returncode, 0)
+                self.assertIn("source or destination branch", p.stderr)
+                self.assertEqual(self.sha(branch), head)
+
+    def test_modified_export_is_preserved(self):
+        self.standard_dev()
+        branch = "pathslice/docs/dev"
+        self.slice("update", "docs", "--from", "dev")
+        self.git("switch", "-q", branch)
+        head = self.commit("Independent work", {"notes/work.md": "keep this\n"})
+        self.git("switch", "-q", "main")
+        for command in (("update",), ("update", "--force-rebuild"), ("forget", "--branch")):
+            with self.subTest(command=command):
+                p = self.slice(*command, "docs", "--from", "dev", check=False)
+                self.assertNotEqual(p.returncode, 0)
+                self.assertIn("changed outside git pathslice", p.stderr)
+                self.assertEqual(self.sha(branch), head)
+
+    def test_copies_and_other_sources_do_not_inherit_ownership(self):
+        self.standard_dev()
+        branch = "review/docs"
+        self.slice("update", "docs", "--from", "dev", "--branch", branch)
+        head = self.sha(branch)
+        self.git("branch", "pathslice/docs/dev", branch)
+        self.git("branch", "feature", "dev")
+        self.slice("add", "specs", "docs/", "--base", "main")
+        for name, source, target in (("docs", "dev", "pathslice/docs/dev"),
+                                     ("docs", "feature", branch), ("specs", "dev", branch)):
+            with self.subTest(name=name, source=source, target=target):
+                p = self.slice("update", name, "--from", source, "--branch", target, check=False)
+                self.assertNotEqual(p.returncode, 0)
+                self.assertEqual(self.sha(target), head)
+
+    def test_forget_retains_ownership_unless_removing_the_branch(self):
+        self.standard_dev()
+        self.slice("update", "docs", "--from", "dev")
+        self.slice("forget", "docs", "--from", "dev")
+        self.slice("update", "docs", "--from", "dev")
+        self.assert_standard_result()
+        source = self.sha("dev")
+        self.git("branch", "-D", "dev")
+        for _ in range(2):
+            self.slice("forget", "docs", "--from", "dev", "--branch")
+        self.assertEqual(self.git("for-each-ref", "--format=%(refname)",
+                                  "refs/heads/pathslice/docs/dev", "refs/pathslices/branches/"), "")
+        self.git("branch", "dev", source)
+        self.slice("update", "docs", "--from", "dev")
+        self.assert_standard_result()
+
+    def test_old_default_export_can_be_updated(self):
+        self.standard_dev()
+        self.slice("update", "docs", "--from", "dev")
+        head = self.sha("pathslice/docs/dev")
+        ref = self.git("for-each-ref", "--format=%(refname)", "refs/pathslices/docs/dev/exports/").strip()
+        record = json.loads(self.git("log", "-1", "--format=%B", ref))
+        for key in ("slice", "source_ref", "branch", "scope"):
+            record.pop(key)
+        old = self.git("commit-tree", self.sha(ref) + "^{tree}", "-p", ref, "-m", json.dumps(record)).strip()
+        self.git("update-ref", ref, old)
+        self.git("update-ref", "-d", "refs/pathslices/branches/pathslice%2Fdocs%2Fdev")
+        self.slice("update", "docs", "--from", "dev")
+        self.assertEqual(self.sha("pathslice/docs/dev"), head)
+        self.slice("forget", "docs", "--from", "dev")
+        self.slice("update", "docs", "--from", "dev")
+        self.assertEqual(self.sha("pathslice/docs/dev"), head)
 
 
 class TestLanding(Base):
@@ -358,6 +456,29 @@ app["main"](["update", "docs", "--from", "dev"])
         self.assertEqual(p.returncode, 99, p.stderr.decode())
         self.slice("continue", "docs", "--from", "dev")
         self.assert_standard_result()
+
+    def test_resume_after_refs_are_committed(self):
+        self.standard_dev()
+        script = '''
+import runpy, sys
+app = runpy.run_path(sys.argv[1], run_name="test")
+remove = app["_remove_worktree"]
+def interrupt(repo, path):
+    if repo.rev("refs/heads/pathslice/docs/dev"):
+        raise SystemExit(99)
+    remove(repo, path)
+app["_finalise"].__globals__["_remove_worktree"] = interrupt
+app["main"](["update", "docs", "--from", "dev"])
+'''
+        p = subprocess.run([sys.executable, "-c", script, SLICE], cwd=self.repo, env=self.env,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(p.returncode, 99, p.stderr.decode())
+        head = self.sha("pathslice/docs/dev")
+        self.slice("continue", "docs", "--from", "dev")
+        self.assertEqual(self.sha("pathslice/docs/dev"), head)
+        self.assert_standard_result()
+        self.assertEqual(self.state_files(), [])
+        self.assertEqual(len(self.worktrees()), 1)
 
     def conflicting_setup(self):
         self.git("switch", "-q", "-c", "dev")
@@ -555,6 +676,15 @@ class TestExportTracking(Base):
 
 
 class TestPush(Base):
+    def test_unrecognised_remote_branch_is_preserved(self):
+        self.standard_dev()
+        bare = self.remote()
+        self.git("push", "-q", "origin", "main:refs/heads/pathslice/docs/dev")
+        p = self.slice("update", "docs", "--from", "dev", "--push", check=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("not a recognised export", p.stderr)
+        self.assertEqual(self.git("rev-parse", "pathslice/docs/dev", cwd=bare).strip(), self.sha("main"))
+
     def test_stale_checkout_cannot_replace_a_newer_export(self):
         other = os.path.join(self.tmp, "other")
         self.standard_dev()
@@ -609,6 +739,24 @@ class TestPush(Base):
 
 
 class TestPullRequest(Base):
+    def test_no_update_cannot_publish_independent_changes(self):
+        self.standard_dev()
+        bare = self.remote()
+        self.slice("update", "docs", "--from", "dev", "--push")
+        exported = self.sha("pathslice/docs/dev")
+        self.git("switch", "-q", "pathslice/docs/dev")
+        self.commit("Independent work", {"src/private.py": "not part of the slice\n"})
+        self.git("switch", "-q", "main")
+        gh = os.path.join(self.tmp, "gh")
+        with open(gh, "w") as f:
+            f.write("#!/bin/sh\nexit 93\n")
+        os.chmod(gh, 0o755)
+        self.env["PATH"] = self.tmp + os.pathsep + self.env["PATH"]
+        p = self.slice("publish", "docs", "--from", "dev", "--no-update", check=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("changed outside git pathslice", p.stderr)
+        self.assertEqual(self.git("rev-parse", "pathslice/docs/dev", cwd=bare).strip(), exported)
+
     def test_updates_reuse_the_request_and_api_errors_are_reported(self):
         self.standard_dev()
         bare = self.remote()
