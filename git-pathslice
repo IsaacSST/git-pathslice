@@ -895,13 +895,23 @@ def cmd_landed(repo: Repo, a: argparse.Namespace) -> None:
     print("slice %s from %s: %s and its ancestors are treated as landed" % (a.name, frm, short(sha)))
 
 
-def cmd_pr(repo: Repo, a: argparse.Namespace) -> int:
+def cmd_publish(repo: Repo, a: argparse.Namespace) -> int:
     if not shutil.which("gh"):
         raise SliceError("`gh` (GitHub CLI) is not installed")
+    if not a.quiet:
+        print("fetching %s" % a.remote)
     repo.run("fetch", a.remote)
     frm = resolve_from(repo, a.frm)
     sl = get_slice(repo, a.name)
     an = analyse(repo, sl, frm, a.onto, a.all)
+    base = an.base.split("/", 1)[1] if an.base.startswith(a.remote + "/") else an.base
+    if not a.quiet:
+        print("slice %s: %s" % (sl.name, " ".join(sl.paths)))
+        print("  source branch: %s (committed changes)" % frm)
+        print("  slice branch: %s" % an.branch)
+        print("  PR destination: %s" % base)
+        if a.no_update:
+            print("  using the existing slice branch; new source changes are excluded")
     head = an.branch_sha if a.no_update else do_update(repo, an, quiet=a.quiet,
                                                      force_rebuild=a.force_rebuild)
     if not head:
@@ -915,11 +925,10 @@ def cmd_pr(repo: Repo, a: argparse.Namespace) -> int:
     if rc != 1:
         raise SliceError(err.strip())
     _push(repo, a.remote, an.branch, an.frm_sha, an.scope, a.quiet)
-    base = an.base.split("/", 1)[1] if an.base.startswith(a.remote + "/") else an.base
     url = github(repo, "pr", "list", "--head", an.branch, "--base", base, "--state", "open",
                  "--json", "url", "--jq", ".[0].url")
     if url:
-        print("existing PR updated: %s" % url)
+        print("using existing PR: %s" % url)
         return 0
     commits = repo.run("log", "--reverse", "--format=- %s (%h)", an.base_sha + ".." + head).strip()
     body = "Slice `%s` (%s) from `%s`.\n\n%s" % (sl.name, " ".join(sl.paths), frm, commits)
@@ -927,7 +936,7 @@ def cmd_pr(repo: Repo, a: argparse.Namespace) -> int:
            "--title", a.title or "%s: %s" % (sl.name, frm), "--body", body]
     if a.draft:
         cmd.append("--draft")
-    print(github(repo, *cmd))
+    print("created PR: %s" % github(repo, *cmd))
     return 0
 
 
@@ -943,17 +952,17 @@ def build_parser() -> argparse.ArgumentParser:
                all_: bool = True, branch: bool = False, quiet: bool = False) -> None:
         if frm:
             sp.add_argument("--from", dest="frm", metavar="BRANCH",
-                            help="source branch (default: the current branch)")
+                            help="branch supplying committed changes (default: the current branch)")
         if onto:
-            sp.add_argument("--onto", metavar="BASE", help="override the slice's base for this run")
+            sp.add_argument("--onto", metavar="BASE", help="destination ref (default: the slice's configured base)")
         if all_:
             sp.add_argument("--all", action="store_true",
-                            help="ignore the slice's selection rule (pure/marked) for this run")
+                            help="ignore the selection rule; keep the slice's path restriction")
         if branch:
             sp.add_argument("--branch", metavar="NAME",
                             help="name of the derived branch (default: pathslice/<name>/<from>)")
         if quiet:
-            sp.add_argument("-q", "--quiet", action="store_true")
+            sp.add_argument("-q", "--quiet", action="store_true", help="suppress progress summaries")
 
     sp = sub.add_parser("add", help="define a slice")
     sp.add_argument("name")
@@ -1015,16 +1024,24 @@ def build_parser() -> argparse.ArgumentParser:
     common(sp, onto=False, all_=False)
     sp.set_defaults(func=cmd_landed)
 
-    sp = sub.add_parser("pr", help="build, push and create or update a pull request")
-    sp.add_argument("name")
+    sp = sub.add_parser(
+        "publish", aliases=["pr"], help="publish selected changes as a pull request",
+        description="Fetch the remote, create or update a separate slice branch from committed source changes, "
+                    "push it, then create or reuse an open PR against the configured destination. "
+                    "The source branch remains unchanged. Merge the PR separately.",
+        epilog="Example: git pathslice publish specs --from feature --onto origin/main. "
+               "Use 'git pathslice log specs' to preview the selection. 'pr' is an alias for 'publish'.",
+    )
+    sp.add_argument("name", metavar="SLICE", help="configured slice defining the paths and destination")
     common(sp, quiet=True)
-    sp.add_argument("--remote", default="origin")
-    sp.add_argument("--title")
-    sp.add_argument("--draft", action="store_true")
-    sp.add_argument("--no-update", action="store_true", help="push the branch as it is")
+    sp.add_argument("--remote", default="origin", help="remote to fetch and push (default: %(default)s)")
+    sp.add_argument("--title", help="title when creating a PR")
+    sp.add_argument("--draft", action="store_true", help="create a new PR as a draft")
+    sp.add_argument("--no-update", action="store_true",
+                    help="use the existing slice branch; still fetch, push and create or reuse a PR")
     sp.add_argument("--force-rebuild", action="store_true",
                     help="rebuild on the current base, rewriting export commits")
-    sp.set_defaults(func=cmd_pr)
+    sp.set_defaults(func=cmd_publish)
     return p
 
 

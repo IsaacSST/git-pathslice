@@ -632,15 +632,15 @@ class TestPullRequest(Base):
                     print("https://example.invalid/pull/1")
                 '''))
         os.chmod(gh, 0o755)
-        self.slice("pr", "docs", "--from", "dev", "--draft")
+        self.slice("publish", "docs", "--from", "dev", "--draft")
         self.git("switch", "-q", "dev")
         self.commit("Later documentation", {"docs/later.md": "later\n"})
         self.git("switch", "-q", "main")
         p = self.slice("pr", "docs", "--from", "dev")
-        self.assertIn("existing PR updated", p.stdout)
+        self.assertIn("using existing PR", p.stdout)
         self.assertEqual(self.git("show", "pathslice/docs/dev:docs/later.md", cwd=bare), "later\n")
         self.env["GH_TEST_FAIL"] = "1"
-        p = self.slice("pr", "docs", "--from", "dev", check=False)
+        p = self.slice("publish", "docs", "--from", "dev", check=False)
         self.assertNotEqual(p.returncode, 0)
         self.assertIn("service unavailable", p.stderr)
         with open(calls) as f:
