@@ -55,7 +55,7 @@ git pathslice publish specs
 pushes it, then creates a PR or reuses an open one. `pr` is an alias for
 `publish`.
 
-Each slice/source pair gets a branch named `pathslice/<slice>/<source>`.
+Each slice/source pair initially uses `pathslice/<slice>/<source>`.
 For a source branch named `feature`, the PR runs from `pathslice/specs/feature`
 into `main`. Later runs update that slice branch; the implementation branch
 remains unchanged. Only committed changes are eligible; uncommitted edits are
@@ -92,6 +92,41 @@ outside the tool. Source and destination branches cannot be export targets.
 These checks also apply to `--force-rebuild` and `publish --no-update`.
 For a collision, rename the ordinary branch or use `update --branch NAME`.
 An ordinary branch created from a slice remains independent.
+
+## Working with Git
+
+Pathslice installs no hooks. Ordinary Git commands remain available; pathslice
+checks before changing branches and reports altered or missing exports in
+`status`. It refuses to update branches checked out or used by a rebase or
+bisect, including in other worktrees. Changes made directly on an export
+remain intact. Transfer intended changes to the source before rebuilding.
+
+After cloning or renaming an export with `git branch -m`, reconnect the local
+branch explicitly:
+
+```sh
+git pathslice adopt specs --from feature --branch review/specs
+```
+
+`adopt` records ownership without changing commits. It requires a matching
+local export record or verifies content and commit metadata against the source
+patches. Independent edits and unverified conflict resolutions are refused.
+If the source was renamed, supply its new name with `--from`.
+Renaming locally does not rename a remote branch or an existing PR.
+
+The recorded branch is used by later commands. `update`, `publish`, `log` and
+`status` accept `--branch` to choose another; multiple exports for the same
+slice and source require an explicit choice. Running from a managed slice
+branch uses its recorded source. If Git deletes a recorded export, recreate
+it explicitly with `update --branch NAME`.
+
+To continue working on an export as an ordinary branch:
+
+```sh
+git pathslice release specs --from feature --branch review/specs
+```
+
+`release` removes ownership while retaining the branch and landing records.
 
 ## Selection
 
@@ -151,15 +186,17 @@ branch. If `publish` stopped on a conflict, rerun it after `continue` to publish
 Pushes use an explicit lease against the last accepted export. Unexpected
 remote changes are refused even after a background fetch. A new checkout
 validates the remote export's scope and source history before replacing it.
-Unrecognised remote branches are refused. Failed pushes leave the local
-export available for retry.
+It also verifies content and commit metadata: provenance trailers alone do not
+establish that a commit is unchanged. Unrecognised or altered remote exports
+are refused. Failed pushes leave the local export available for retry.
 
 ## Other commands
 
 `list` and `status` inspect slices; `rm` removes definitions. `forget` removes
 landing records and checkpoints but retains branch ownership and publication
-leases. `forget --branch` also deletes the default slice branch and its
-ownership record, provided the branch is unchanged and not checked out.
+leases. `forget --branch` also deletes the recorded slice branch and its
+ownership record, provided the branch is unchanged and not in use. Use
+`--export-branch NAME` to choose among multiple exports when deleting.
 Use `git pathslice COMMAND -h` for options.
 
 ## Limits and tests
