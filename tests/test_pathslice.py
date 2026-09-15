@@ -264,6 +264,22 @@ class TestLanding(Base):
         self.land_then_continue()
         self.assertEqual(self.show("pathslice/docs/dev", "docs/index.md"), "intro, clarified, more, and main\n")
 
+    def test_squash_after_main_changes_an_unrelated_document(self):
+        self.standard_dev()
+        self.slice("update", "docs", "--from", "dev")
+        self.commit("Another contributor updates the changelog", {"docs/changelog.md": "changelog 2\n"})
+        self.git("merge", "-q", "--squash", "pathslice/docs/dev")
+        self.git("commit", "-q", "-m", "Land the documentation")
+        self.land_then_continue()
+        self.assertEqual(self.show("pathslice/docs/dev", "docs/changelog.md"), "changelog 2\n")
+
+    def test_partial_squash_does_not_mark_the_whole_export_landed(self):
+        self.standard_dev()
+        self.slice("update", "docs", "--from", "dev")
+        self.commit("Import only part of the documentation", {"docs/index.md": "intro, clarified, more\n"})
+        out = self.slice("log", "docs", "--from", "dev").stdout
+        self.assertIn("pending: 2 commits", out)
+
     def test_rebase_merge_uses_patch_ids(self):
         self.standard_dev()
         self.slice("update", "docs", "--from", "dev")

@@ -362,6 +362,11 @@ def _provenance(repo, scope, *revs):
 
 
 def _content_landed(repo, branch_sha, base_sha, previous_base, paths) -> bool:
+    changed = repo.run("diff", "--name-only", "--no-renames", "-z", previous_base, branch_sha,
+                       "--", *paths, binary=True).split(b"\0")
+    paths = [":(top,literal)" + os.fsdecode(path) for path in changed if path]
+    if not paths:
+        return False
     shas = repo.run("rev-list", base_sha, "^" + previous_base, "--", *paths).split()
     for s in shas:
         rc, _, _ = repo.try_run("diff", "--quiet", s, branch_sha, "--", *paths)
