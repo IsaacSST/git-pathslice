@@ -1,15 +1,15 @@
-# git slice
+# git pathslice
 
 Path-scoped branches derived from another branch.
 
 A *slice* names a set of paths (say `docs/`) and a base branch (say `main`).
-`git slice update docs` rebuilds the branch `slice/docs/<from>` as `main` plus
+`git pathslice update docs` rebuilds the branch `pathslice/docs/<from>` as `main` plus
 the commits on `<from>` that touch `docs/`, each restricted to those paths,
 skipping whatever `main` already contains. The result can be pull-requested
 into `main` on its own while the rest of `<from>` carries on.
 
 Git has no per-path branches: a ref names a commit and a commit names a whole
-tree. `git slice` does not change that. It is a path-filtered rebase with a
+tree. `git pathslice` does not change that. It is a path-filtered rebase with a
 memory, built from `format-patch`, `am -3`, `patch-id` and a temporary
 worktree.
 
@@ -18,26 +18,26 @@ worktree.
 Needs git 2.22 or newer and Python 3.
 
 ```bash
-ln -s "$PWD/git-slice" ~/.local/bin/git-slice   # any directory on PATH
-git slice -h        # `git slice --help` looks for a man page, as git does for any subcommand
+ln -s "$PWD/git-pathslice" ~/.local/bin/git-pathslice   # any directory on PATH
+git pathslice -h        # `git pathslice --help` looks for a man page, as git does for any subcommand
 ```
 
 ## Quick start
 
 ```bash
 # in the repository, once
-git slice add docs docs/ --base main          # local definition (.git/config)
-git slice add docs docs/ --base main --shared # or committed, in .gitslices
+git pathslice add docs docs/ --base main          # local definition (.git/config)
+git pathslice add docs docs/ --base main --shared # or committed, in .gitpathslices
 
 # on a feature branch that has accumulated docs changes
-git slice log docs        # what an update would do, commit by commit
-git slice update docs     # build slice/docs/<branch> from main
-git slice update docs --push
-git slice pr docs         # update, push, open or refresh a PR with gh
+git pathslice log docs        # what an update would do, commit by commit
+git pathslice update docs     # build pathslice/docs/<branch> from main
+git pathslice update docs --push
+git pathslice pr docs         # update, push, open or refresh a PR with gh
 ```
 
 Your own checkout is never touched. The work happens in a temporary worktree
-under `.git/slice/wt/`, which is removed when the update finishes.
+under `.git/pathslice/wt/`, which is removed when the update finishes.
 
 ## What an update does
 
@@ -45,11 +45,14 @@ under `.git/slice/wt/`, which is removed when the update finishes.
    slice's paths. Merge commits are ignored.
 2. Drops the ones `<base>` already has (see *Landing* below) and the ones the
    slice's selection rule excludes.
-3. Rebuilds `slice/<name>/<from>` from `<base>` by replaying the rest with
+3. Rebuilds `pathslice/<name>/<from>` from `<base>` by replaying the rest with
    `git am -3`, each patch restricted to the slice's paths. A commit that also
    touched other files comes through with only its in-slice hunks. Messages
    and authorship are kept; a `Sliced-From: <sha>` trailer is added.
-4. Records the source tip under `refs/slices/<name>/<from>/source`.
+4. Records the source tip under `refs/pathslices/<name>/<from>/source`.
+
+The `Slice:` and `Sliced-From:` commit trailers retain their existing names,
+so historical commit messages remain readable without rewriting history.
 
 The derived branch is disposable. Do not commit on it; edit on `<from>` and run
 `update` again.
@@ -71,9 +74,9 @@ current base. If the branch has meanwhile stopped applying cleanly to base,
 The difficulty in this workflow is the second update: after the slice branch
 has been merged into base, dev's original commits are still not ancestors of
 base, and replaying them again conflicts wherever a later commit touched the
-same lines. `git slice` avoids that in four ways, checked in this order:
+same lines. `git pathslice` avoids that in four ways, checked in this order:
 
-- **Recorded landed point.** `refs/slices/<name>/<from>/landed` marks the
+- **Recorded landed point.** `refs/pathslices/<name>/<from>/landed` marks the
   source commit up to which everything is known to be in base. Only commits
   after it are considered. It advances automatically when:
   - the previous slice branch is now an ancestor of base (merge commit or
@@ -84,7 +87,7 @@ same lines. `git slice` avoids that in four ways, checked in this order:
   as landed. This survives rebase-merges and cherry-picks.
 - **Patch ids.** A candidate whose path-restricted patch id matches one on
   base is landed, even if the message was rewritten.
-- **`git slice landed <name> <rev>`** declares it by hand.
+- **`git pathslice landed <name> <rev>`** declares it by hand.
 
 What this does not cover: a squash merge followed by further edits to the same
 lines on base *before* the next update, when the tool has no record of the
@@ -115,29 +118,29 @@ in place:
 
 ```
 conflict while replaying 3f2a1c9e0b docs: reword intro
-  resolve it in:  /path/to/repo/.git/slice/wt/docs/dev
-  then run:       git slice continue docs --from dev
-  or:             git slice skip docs --from dev   /   git slice abort docs --from dev
+  resolve it in:  /path/to/repo/.git/pathslice/wt/docs/dev
+  then run:       git pathslice continue docs --from dev
+  or:             git pathslice skip docs --from dev   /   git pathslice abort docs --from dev
 ```
 
-Edit the files there, `git add` them, then `git slice continue`. `skip` drops
+Edit the files there, `git add` them, then `git pathslice continue`. `skip` drops
 that one commit; `abort` removes the worktree and leaves the old branch as it
 was.
 
 ## Commands
 
 ```
-git slice add <name> <path>... [--base B] [--select all|pure|marked] [--subject RE] [--shared]
-git slice rm <name> [--shared]
-git slice list
-git slice log <name> [--from B] [--onto B] [--all]        dry run, commit by commit
-git slice status [<name>] [--from B]                        one summary per slice
-git slice update <name> [--from B] [--onto B] [--all] [--branch NAME] [--push [REMOTE]]
+git pathslice add <name> <path>... [--base B] [--select all|pure|marked] [--subject RE] [--shared]
+git pathslice rm <name> [--shared]
+git pathslice list
+git pathslice log <name> [--from B] [--onto B] [--all]        dry run, commit by commit
+git pathslice status [<name>] [--from B]                        one summary per slice
+git pathslice update <name> [--from B] [--onto B] [--all] [--branch NAME] [--push [REMOTE]]
                         [--force-rebuild] [-q]
-git slice continue|skip|abort <name> [--from B]
-git slice forget <name> [--from B] [--branch]               drop the sync refs (and branch)
-git slice landed <name> <rev> [--from B]
-git slice pr <name> [--remote R] [--title T] [--draft] [--no-update] [--force-rebuild]
+git pathslice continue|skip|abort <name> [--from B]
+git pathslice forget <name> [--from B] [--branch]               drop the sync refs (and branch)
+git pathslice landed <name> <rev> [--from B]
+git pathslice pr <name> [--remote R] [--title T] [--draft] [--no-update] [--force-rebuild]
 ```
 
 `--from` defaults to the current branch. `--base` defaults to `origin/HEAD`,
@@ -146,11 +149,11 @@ slice built on the remote's tip.
 
 ## Shared definitions
 
-`--shared` writes to `.gitslices` at the repository root, in git config
+`--shared` writes to `.gitpathslices` at the repository root, in git config
 syntax, so the definition travels with the repository:
 
 ```
-[slice "docs"]
+[pathslice "docs"]
 	path = docs/
 	path = README.md
 	base = main
@@ -158,7 +161,7 @@ syntax, so the definition travels with the repository:
 	subject = ^docs(\\(.*\\))?:
 ```
 
-Local definitions in `.git/config` use the same keys under `slice.<name>.*`
+Local definitions in `.git/config` use the same keys under `pathslice.<name>.*`
 and add to the shared ones.
 
 ## GitHub
@@ -209,13 +212,13 @@ jobs:
       - run: |
           git config user.name  'docs-slice[bot]'
           git config user.email 'docs-slice@users.noreply.github.com'
-          git slice pr docs --from dev --onto origin/main --draft
+          git pathslice pr docs --from dev --onto origin/main --draft
         env:
           GH_TOKEN: ${{ secrets.SLICE_TOKEN }}
 ```
 
 `--onto origin/main` is worth being explicit about in CI, where
-`refs/remotes/origin/HEAD` is often unset. `git slice pr` refreshes an existing
+`refs/remotes/origin/HEAD` is often unset. `git pathslice pr` refreshes an existing
 open pull request rather than opening a second one, so this is safe to run on
 every push.
 
@@ -243,7 +246,7 @@ A `post-commit` hook keeps a docs PR waiting for review at all times:
 #!/bin/sh
 branch=$(git symbolic-ref --short -q HEAD) || exit 0
 [ "$branch" = main ] && exit 0
-git slice update docs -q --push 2>/dev/null || true
+git pathslice update docs -q --push 2>/dev/null || true
 ```
 
 Or run the same from CI on push. The update takes well under a second on a

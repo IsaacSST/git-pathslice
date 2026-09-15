@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""git slice: path-scoped branches derived from another branch.
+"""git pathslice: path-scoped branches derived from another branch.
 
 A slice names a set of paths (for example docs/) and a base branch (for
-example main).  `git slice update <name>` rebuilds the branch
-slice/<name>/<from> as <base> plus the commits on <from> that touch the
+example main).  `git pathslice update <name>` rebuilds the branch
+pathslice/<name>/<from> as <base> plus the commits on <from> that touch the
 slice's paths, each restricted to those paths, skipping whatever <base>
 already contains.  The result can be pull-requested into <base> on its own.
 
-State kept per (slice, source branch), as refs under refs/slices/:
+State kept per (slice, source branch), as refs under refs/pathslices/:
   .../source   the source tip at the last successful update
   .../landed   the source commit up to which everything is known to be in base
 
@@ -26,9 +26,9 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 VERSION = "0.1.0"
-SHARED_FILE = ".gitslices"
-REF_ROOT = "refs/slices"
-BRANCH_ROOT = "slice"
+SHARED_FILE = ".gitpathslices"
+REF_ROOT = "refs/pathslices"
+BRANCH_ROOT = "pathslice"
 TRAILER = "Sliced-From"
 MARK_TRAILER = "Slice"
 SELECTS = ("all", "pure", "marked")
@@ -67,7 +67,7 @@ class Repo:
             raise SliceError("not inside a git work tree")
         self.top = _s(out).strip()
         self.common = os.path.abspath(os.path.join(self.top, self.run("rev-parse", "--git-common-dir").strip()))
-        wt_root = os.path.join(self.common, "slice", "wt")
+        wt_root = os.path.join(self.common, "pathslice", "wt")
         if os.path.realpath(self.top).startswith(os.path.realpath(wt_root) + os.sep):
             # invoked from inside one of our temporary worktrees: use the main one
             first = self.run("worktree", "list", "--porcelain").splitlines()[0]
@@ -141,7 +141,7 @@ class Repo:
             m = re.search(r"(\d+)\.(\d+)", self.run("--version"))
             ver = (int(m.group(1)), int(m.group(2))) if m else (0, 0)
             if ver < MIN_GIT:
-                raise SliceError("git slice needs git %d.%d or newer" % MIN_GIT)
+                raise SliceError("git pathslice needs git %d.%d or newer" % MIN_GIT)
             _, out, err = self.try_run("am", "-h")
             _, mt_out, mt_err = self.try_run("merge-tree", "-h")
             self._features = {"am_no_verify": "--no-verify" in out + err,
@@ -167,7 +167,7 @@ def _config_entries(repo, file=None) -> List[Tuple[str, str]]:
         if not os.path.exists(os.path.join(repo.top, file)):
             return []
         args += ["--file", file]
-    args += ["--get-regexp", r"^slice\."]
+    args += ["--get-regexp", r"^pathslice\."]
     rc, out, err = repo.try_run(*args)
     if rc == 1:
         return []
@@ -186,7 +186,7 @@ def load_slices(repo) -> Dict[str, Slice]:
     slices: Dict[str, Slice] = {}
     for where, file in (("shared", SHARED_FILE), ("local", None)):
         for key, value in _config_entries(repo, file):
-            body = key[len("slice."):]
+            body = key[len("pathslice."):]
             name, _, field_ = body.rpartition(".")
             if not name or not field_:
                 continue
@@ -200,7 +200,7 @@ def load_slices(repo) -> Dict[str, Slice]:
                 sl.base = value
             elif field_ == "select":
                 if value not in SELECTS:
-                    raise SliceError("slice.%s.select must be one of %s" % (name, ", ".join(SELECTS)))
+                    raise SliceError("pathslice.%s.select must be one of %s" % (name, ", ".join(SELECTS)))
                 sl.select = value
             elif field_ == "subject":
                 sl.subject = value
@@ -220,7 +220,7 @@ def default_base(repo) -> str:
 def get_slice(repo, name) -> Slice:
     slices = load_slices(repo)
     if name not in slices:
-        raise SliceError("no slice named '%s' (see `git slice list`)" % name)
+        raise SliceError("no slice named '%s' (see `git pathslice list`)" % name)
     sl = slices[name]
     if not sl.paths:
         raise SliceError("slice '%s' has no paths" % name)
@@ -250,11 +250,11 @@ def escape(s: str) -> str:
 
 
 def worktree_path(repo, name, frm) -> str:
-    return os.path.join(repo.common, "slice", "wt", escape(name), escape(frm))
+    return os.path.join(repo.common, "pathslice", "wt", escape(name), escape(frm))
 
 
 def state_path(repo, name, frm) -> str:
-    return os.path.join(repo.common, "slice", "state", escape(name), escape(frm) + ".json")
+    return os.path.join(repo.common, "pathslice", "state", escape(name), escape(frm) + ".json")
 
 
 # ----------------------------------------------------------------- analysis
@@ -541,8 +541,8 @@ def _run_queue(repo, st, quiet=False) -> bool:
             sys.stderr.write(
                 "conflict while replaying %s %s\n"
                 "  resolve it in:  %s\n"
-                "  then run:       git slice continue %s --from %s\n"
-                "  or:             git slice skip %s --from %s   /   git slice abort %s --from %s\n"
+                "  then run:       git pathslice continue %s --from %s\n"
+                "  or:             git pathslice skip %s --from %s   /   git pathslice abort %s --from %s\n"
                 % (short(st["current"]), subject, wt, st["name"], st["frm"],
                    st["name"], st["frm"], st["name"], st["frm"]))
             return False
@@ -634,8 +634,8 @@ def _conflicts_with_base(repo, an: Analysis) -> bool:
 
 def do_update(repo, sl, an: Analysis, push: Optional[str], quiet: bool, force_rebuild: bool = False) -> bool:
     if _load_state(repo, sl.name, an.frm):
-        raise SliceError("an update of slice '%s' from %s is in progress; run `git slice continue` "
-                         "or `git slice abort`" % (sl.name, an.frm))
+        raise SliceError("an update of slice '%s' from %s is in progress; run `git pathslice continue` "
+                         "or `git pathslice abort`" % (sl.name, an.frm))
     at = repo.branch_checked_out_at(an.branch)
     if at:
         raise SliceError("branch %s is checked out at %s; detach it first" % (an.branch, at))
@@ -685,8 +685,8 @@ def cmd_add(repo, a):
     target = ["--file", SHARED_FILE] if a.shared else ["--local"]
     where = "shared" if a.shared else "local"
     if existing and where in existing.where:
-        raise SliceError("slice '%s' is already defined (%s); remove it first with `git slice rm`" % (a.name, where))
-    key = "slice.%s." % a.name
+        raise SliceError("slice '%s' is already defined (%s); remove it first with `git pathslice rm`" % (a.name, where))
+    key = "pathslice.%s." % a.name
     for p in a.paths:
         repo.run("config", *target, "--add", key + "path", normalise_path(p))
     if a.base:
@@ -711,14 +711,14 @@ def cmd_rm(repo, a):
     if where not in sl.where:
         raise SliceError("slice '%s' has no %s definition (defined: %s)" % (a.name, where, ", ".join(sl.where)))
     target = ["--file", SHARED_FILE] if a.shared else ["--local"]
-    repo.run("config", *target, "--remove-section", "slice." + a.name)
+    repo.run("config", *target, "--remove-section", "pathslice." + a.name)
     print("removed the %s definition of slice %s" % (where, a.name))
 
 
 def cmd_list(repo, a):
     slices = load_slices(repo)
     if not slices:
-        print("no slices defined (add one with `git slice add <name> <path>...`)")
+        print("no slices defined (add one with `git pathslice add <name> <path>...`)")
         return
     for sl in slices.values():
         base = sl.base or default_base(repo) + " (default)"
@@ -813,7 +813,7 @@ def _resume(repo, a, mode) -> int:
                 if rc != 0:
                     sys.stderr.write(err.strip() + "\n")
                     sys.stderr.write("resolve the conflict in %s (git add the files), then run "
-                                     "git slice continue again\n" % wt)
+                                     "git pathslice continue again\n" % wt)
                     return 1
             _finish_current(repo, st)
     return 0 if _run_queue(repo, st, a.quiet) else 1
@@ -875,7 +875,7 @@ def cmd_pr(repo, a):
     if url:
         print("existing PR updated: %s" % url)
         return 0
-    body_lines = ["Slice `%s` (%s) from `%s`, rebuilt by `git slice`." % (sl.name, " ".join(sl.paths), frm), ""]
+    body_lines = ["Slice `%s` (%s) from `%s`, rebuilt by `git pathslice`." % (sl.name, " ".join(sl.paths), frm), ""]
     for line in repo.run("log", "--reverse", "--format=- %s (%h)", an.base + ".." + an.branch).splitlines():
         body_lines.append(line)
     title = a.title or "%s: %s" % (sl.name, frm)
@@ -890,8 +890,8 @@ def cmd_pr(repo, a):
 # --------------------------------------------------------------------- main
 
 def build_parser():
-    p = argparse.ArgumentParser(prog="git slice", description=__doc__.split("\n\n")[0])
-    p.add_argument("--version", action="version", version="git-slice " + VERSION)
+    p = argparse.ArgumentParser(prog="git pathslice", description=__doc__.split("\n\n")[0])
+    p.add_argument("--version", action="version", version="git-pathslice " + VERSION)
     sub = p.add_subparsers(dest="cmd", metavar="<command>")
 
     def common(sp, frm=True, onto=True, all_=True, branch=False, quiet=False):
@@ -905,7 +905,7 @@ def build_parser():
                             help="ignore the slice's selection rule (pure/marked) for this run")
         if branch:
             sp.add_argument("--branch", metavar="NAME",
-                            help="name of the derived branch (default: slice/<name>/<from>)")
+                            help="name of the derived branch (default: pathslice/<name>/<from>)")
         if quiet:
             sp.add_argument("-q", "--quiet", action="store_true")
 
@@ -977,7 +977,7 @@ def build_parser():
     sp.add_argument("--title")
     sp.add_argument("--draft", action="store_true")
     sp.add_argument("--no-update", action="store_true", help="push the branch as it is")
-    sp.add_argument("--force-rebuild", action="store_true", help="see `git slice update --force-rebuild`")
+    sp.add_argument("--force-rebuild", action="store_true", help="see `git pathslice update --force-rebuild`")
     sp.set_defaults(func=cmd_pr)
     return p
 
