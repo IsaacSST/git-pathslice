@@ -10,7 +10,7 @@ manages pull requests.
 
 ## Installation
 
-Requires Git 2.22 or later and Python 3.7 or later. PR commands require
+Requires Git 2.22 or later and Python 3.12 or later. PR commands require
 GitHub CLI, authenticated with `gh auth login`.
 
 ```sh
@@ -141,10 +141,15 @@ may therefore be omitted without a conflict. Review the final diff.
 Renames crossing a slice boundary become additions or deletions. Path
 selection does not check dependencies between specifications and code.
 
-Tests require Git 2.28 or later:
+Development uses Python 3.14. Compatibility checks cover Python 3.12
+(used by RavensPort) and 3.14. Tests require Git 2.28 or later.
 
 ```sh
-python3 -m unittest discover -s tests -v
+python3.14 -m venv .venv
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python -m mypy
+.venv/bin/python -m ruff check git-pathslice tests
+.venv/bin/python -m unittest discover -s tests -v
 ```
 
 Tests use temporary Git repositories and local remotes. GitHub PR calls
