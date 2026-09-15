@@ -1,7 +1,7 @@
 # git pathslice
 
 Derive branches containing selected paths from a source branch. Each selected
-source commit becomes a separate commit on the destination branch, retaining
+source commit becomes a separate commit on the derived branch, retaining
 its message, author and author date. Mixed commits contribute only the selected
 paths. The source checkout and branch remain unchanged.
 
@@ -11,15 +11,20 @@ the temporary worktree. GitHub operations use `gh`.
 
 ## Installation
 
-Requires Git 2.22 or later and Python 3. PR commands also require GitHub CLI.
-From this directory:
+Requires Git 2.22 or later and Python 3.7 or later. PR commands also require
+GitHub CLI, authenticated with `gh auth login`.
 
 ```sh
+git clone https://github.com/IsaacSST/git-pathslice.git
+cd git-pathslice
+mkdir -p ~/.local/bin
 ln -s "$PWD/git-pathslice" ~/.local/bin/git-pathslice
+export PATH="$HOME/.local/bin:$PATH"
 git pathslice -h
 ```
 
 Git's `--help` option looks for a manual page; use `-h` for the command help.
+Keep `~/.local/bin` on your shell's `PATH` for subsequent sessions.
 
 ## Repository setup
 
@@ -53,11 +58,14 @@ git pathslice update docs    # build locally
 git pathslice pr docs        # fetch, build, push and create or update the PR
 ```
 
+`log` and `update` are optional previews; `pr` includes the build step. If
+there are no changes to publish, it exits without opening a PR.
+
 The default derived branch is `pathslice/docs/<source-branch>`. Make subsequent
 edits on the source branch and run the same command again. Derived branches
 are generated outputs; do not edit them directly.
 
-`update` uses the currently available refs. `pr` fetches its remote first.
+`log` and `update` use the currently available refs. `pr` fetches its remote first.
 Use `--from BRANCH` to select another source and `--onto REF` to override the
 destination. No update is performed on the source checkout.
 
@@ -66,6 +74,16 @@ does not rebuild an open PR; `--force-rebuild` requests that rebase. The tool
 reports conflicts with the current destination when Git supports this check.
 Each replay uses the source committer's identity and date, so rebuilding with
 the same inputs also gives the same commit IDs.
+
+For example, a source commit might change both `src/parser.rs` and `docs/parser.md`.
+The `docs` slice exports only the change to `docs/parser.md`, retaining the
+source message and authorship and adding provenance trailers. The restricted
+patch and added trailers give it a different commit hash. The derived branch retains
+the destination's version of `src/parser.rs`.
+
+Merge the documentation PR through the usual review process. The implementation
+commits remain on the source branch. Subsequent `pr` runs identify the changes
+already incorporated into the destination and export the remaining selection.
 
 ## Selection
 
@@ -91,7 +109,8 @@ Local export records under `refs/pathslices/` retain the exported revisions
 and the revisions known to have landed. They are updated atomically with the
 derived branch. Normal merges are recognised through ancestry. Squash merges
 can be recognised when a later destination revision matches the exported
-content in the selected paths. In either case, only the recorded exported
+content in every file changed by the export. Changes to other files do not
+affect this comparison. In either case, only the recorded exported
 commits are marked as landed. Git's path-restricted patch equivalence also
 recognises independently applied commits without matching trailers.
 
@@ -128,6 +147,8 @@ git pathslice abort docs
 
 `continue` retains the source author and committer metadata. `abort` removes
 the temporary worktree and leaves the previous derived branch intact.
+If `pr` stopped on a conflict, rerun it after `continue` completes to publish
+the branch and create or update the PR.
 
 Pushes use an explicit lease against the last successfully published revision.
 A newer remote export is refused even if a background fetch has updated the
@@ -150,12 +171,16 @@ merge resolution can therefore be absent without a conflict being reported.
 Review the final PR against the intended changes, especially when importing
 an existing branch. Renames crossing a slice boundary appear as additions or
 deletions.
+Path selection does not check dependencies between documentation and
+implementation changes.
 
 Without a local record or scoped trailers, squash merges that combine several
 changes may require an explicit checkpoint. Private export records and
 publication leases do not travel with an ordinary clone.
+A squash with additional edits to the exported files may also require a
+checkpoint, because their content no longer matches the export.
 
-Run the scenario tests with:
+The scenario tests require Git 2.28 or later. Run them with:
 
 ```sh
 python3 -m unittest discover -s tests -v
