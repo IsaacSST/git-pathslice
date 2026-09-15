@@ -271,8 +271,10 @@ def projection_scope(sl: Slice, base: str) -> str:
 
 def read_record(repo: Repo, ref: str) -> tuple[str | None, ExportRecord | None]:
     sha = repo.rev(ref)
-    record = cast("ExportRecord", json.loads(repo.run("log", "-1", "--format=%B", sha))) if sha else None
-    return sha, record
+    if sha is None:
+        return None, None
+    message = repo.run("log", "-1", "--format=%B", sha)
+    return sha, cast("ExportRecord", json.loads(message))
 
 
 def record_commit(repo: Repo, record: ExportRecord, previous: str | None) -> str:
@@ -446,8 +448,13 @@ def analyse(repo: Repo, sl: Slice, frm: str, base: str | None = None, all_: bool
         elif not all_ and sl.select == "marked" and not c.marked:
             c.decision = "skip (unmarked)"
     landed.update(equivalents)
-    return Analysis(sl, frm, frm_sha, base, base_sha, branch, branch_sha, scope,
-                    record_ref, record_sha, record, landed, checkpoints, landed_how, warnings, cands)
+    return Analysis(
+        sl=sl, frm=frm, frm_sha=frm_sha,
+        base=base, base_sha=base_sha, branch=branch, branch_sha=branch_sha,
+        scope=scope, record_ref=record_ref, record_sha=record_sha, record=record,
+        landed=landed, checkpoints=checkpoints, landed_how=landed_how,
+        warnings=warnings, candidates=cands,
+    )
 
 # Updates
 
