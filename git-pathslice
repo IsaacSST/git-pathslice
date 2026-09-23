@@ -1205,8 +1205,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="Fetch the remote, add the source's latest changes to the slice's export branch, push it, "
                     "then create or reuse an open PR against the base. The source branch remains unchanged. "
                     "Merge the PR separately.",
-        epilog="Example: git pathslice publish specs --from feature. "
-               "Use 'git pathslice log specs' to preview the export. 'pr' is an alias for 'publish'.",
+        epilog="Example: git pathslice publish docs --from feature. "
+               "Use 'git pathslice log docs' to preview the export. 'pr' is an alias for 'publish'.",
     )
     sp.add_argument("name", metavar="SLICE", help="configured slice defining the paths and base")
     common(sp, quiet=True)
