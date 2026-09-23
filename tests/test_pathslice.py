@@ -1,4 +1,5 @@
 """Git history scenarios for git-pathslice."""
+import hashlib
 import json
 import os
 import shutil
@@ -24,6 +25,7 @@ class Base(unittest.TestCase):
             "GIT_COMMITTER_NAME": "Dev", "GIT_COMMITTER_EMAIL": "dev@example.com",
         })
         self.env = env
+        self.clones = 0
         self.repo = os.path.join(self.tmp, "repo")
         os.makedirs(self.repo)
         self.git("init", "-q", "-b", "main")
@@ -32,15 +34,15 @@ class Base(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def git(self, *args, cwd=None, binary=False):
-        p = subprocess.run(["git", *args], cwd=cwd or self.repo, env=self.env,
+    def git(self, *args, cwd=None, binary=False, env=None):
+        p = subprocess.run(["git", *args], cwd=cwd or self.repo, env=env or self.env,
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if p.returncode != 0:
             raise AssertionError("git %s failed: %s" % (" ".join(args), p.stderr.decode()))
         return p.stdout if binary else p.stdout.decode()
 
-    def slice(self, *args, cwd=None, check=True):
-        p = subprocess.run([sys.executable, SLICE, *args], cwd=cwd or self.repo, env=self.env,
+    def slice(self, *args, cwd=None, check=True, env=None):
+        p = subprocess.run([sys.executable, SLICE, *args], cwd=cwd or self.repo, env=env or self.env,
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if check and p.returncode != 0:
             raise AssertionError("git pathslice %s failed (rc %d):\n%s\n%s"
@@ -76,8 +78,8 @@ class Base(unittest.TestCase):
     def sha(self, rev, cwd=None):
         return self.git("rev-parse", "--verify", rev + "^{commit}", cwd=cwd).strip()
 
-    def show(self, rev, path, binary=False):
-        return self.git("show", "%s:%s" % (rev, path), binary=binary)
+    def show(self, rev, path, binary=False, cwd=None):
+        return self.git("show", "%s:%s" % (rev, path), binary=binary, cwd=cwd)
 
     def exists(self, rev, path):
         p = subprocess.run(["git", "cat-file", "-e", "%s:%s" % (rev, path)], cwd=self.repo, env=self.env,
@@ -88,8 +90,14 @@ class Base(unittest.TestCase):
         """Files a pull request from branch into base would change."""
         return self.git("diff", "--name-only", "%s...%s" % (base, branch)).split()
 
-    def switch(self, branch, create=False, start=None):
-        self.git("switch", "-q", *(["-c", branch] + ([start] if start else []) if create else [branch]))
+    def switch(self, branch, create=False, start=None, cwd=None):
+        self.git("switch", "-q", *(["-c", branch] + ([start] if start else []) if create else [branch]), cwd=cwd)
+
+    def later(self, subject="docs: later note", files=None):
+        """Commit a documentation change to dev and return to main."""
+        self.switch("dev")
+        self.commit(subject, files or {"docs/later.md": "later\n"})
+        self.switch("main")
 
     def remote(self):
         bare = os.path.join(self.tmp, "remote.git")
@@ -98,10 +106,26 @@ class Base(unittest.TestCase):
         self.git("push", "-q", "origin", "main", "dev")
         return bare
 
-    def clone(self, bare, name):
-        other = os.path.join(self.tmp, name)
-        self.git("clone", "-q", bare, other)
+    def clone(self, bare, *options):
+        self.clones += 1
+        other = os.path.join(self.tmp, "clone%d" % self.clones)
+        self.git("clone", "-q", *options, bare, other)
         return other
+
+    def review(self, bare, files):
+        """Commit a review suggestion to the remote export branch from another clone."""
+        reviewer = self.clone(bare)
+        self.git("switch", "-q", BRANCH, cwd=reviewer)
+        self.commit("Apply suggestion from review", files, cwd=reviewer)
+        self.git("push", "-q", "origin", BRANCH, cwd=reviewer)
+        return self.git("rev-parse", BRANCH, cwd=bare).strip()
+
+    def legacy_record(self, branch, source_ref="dev", name="docs"):
+        """Write a branch record as git pathslice 0.2 did."""
+        empty = self.git("hash-object", "-t", "tree", "-w", os.devnull).strip()
+        record = json.dumps({"slice": name, "source_ref": source_ref, "branch": branch})
+        sha = self.git("commit-tree", empty, "-m", record).strip()
+        self.git("update-ref", "refs/pathslices/branches/" + branch.replace("/", "%2F"), sha)
 
     def fake_gh(self):
         gh = os.path.join(self.tmp, "gh")
@@ -126,6 +150,10 @@ class Base(unittest.TestCase):
         os.chmod(gh, 0o755)
         return calls
 
+    def gh_calls(self, calls):
+        with open(calls) as f:
+            return [json.loads(line) for line in f]
+
     def dev(self):
         """dev changes documentation and code; main gains an unrelated page."""
         self.switch("dev", create=True)
@@ -137,7 +165,7 @@ class Base(unittest.TestCase):
         self.commit("main docs change", {"docs/changelog.md": "changelog\n"})
         self.slice("add", "docs", "docs/", "--base", "main")
 
-    def lineage(self):
+    def lineage(self, upstream=True):
         """feature is developed on dev, whose documentation is not yet on main."""
         self.switch("dev", create=True)
         self.commit("dev: code", {"src/a.py": "x=2\n"})
@@ -145,7 +173,7 @@ class Base(unittest.TestCase):
         self.switch("feature", create=True)
         self.commit("feature: code and documentation", {"src/b.py": "y=1\n", "docs/feature.md": "feature\n"})
         self.switch("main")
-        self.slice("add", "docs", "docs/", "--base", "main", "--upstream", "dev")
+        self.slice("add", "docs", "docs/", "--base", "main", *(["--upstream", "dev"] if upstream else []))
 
 
 class TestExport(Base):
@@ -163,7 +191,8 @@ class TestExport(Base):
         self.assertIn("- docs: clarify intro", body)
         self.assertIn("- Add feature and documentation", body)
         self.assertNotIn("code only", body)
-        self.assertIn("Pathslice-Source: dev " + self.sha("dev"), body)
+        for trailer in ("Pathslice-Source: dev " + self.sha("dev"), "Pathslice-Base: main", "Pathslice-Path: docs/"):
+            self.assertIn(trailer, body)
         self.assertEqual(self.git("symbolic-ref", "--short", "HEAD").strip(), "main")
         self.assertEqual(self.git("status", "--porcelain"), "")
 
@@ -194,6 +223,16 @@ class TestExport(Base):
         self.slice("update", "docs")
         self.assertEqual(self.show(BRANCH, "docs/img.png", binary=True), png)
 
+    def test_old_commit_dates(self):
+        self.switch("dev", create=True)
+        self.env.update({"GIT_AUTHOR_DATE": "@70000000 +0000", "GIT_COMMITTER_DATE": "@70000000 +0000"})
+        self.commit("docs: old note", {"docs/old.md": "old page, 1972\n"})
+        for key in ("GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"):
+            del self.env[key]
+        self.slice("add", "docs", "docs/", "--base", "main")
+        self.slice("update", "docs")
+        self.assertEqual(self.git("log", "-1", "--format=%at", BRANCH).strip(), "70000000")
+
     def test_definition_is_read_from_the_source(self):
         self.switch("dev", create=True)
         self.slice("add", "docs", "docs/", "--base", "main", "--shared")
@@ -203,6 +242,10 @@ class TestExport(Base):
         self.slice("update", "docs", "--from", "dev")
         self.assertEqual(self.proposed(BRANCH), ["docs/index.md"])
 
+    def test_paths_given_in_a_subdirectory_are_stored_from_the_root(self):
+        self.slice("add", "docs", "index.md", "--base", "main", cwd=os.path.join(self.repo, "docs"))
+        self.assertEqual(self.git("config", "pathslice.docs.path").strip(), "docs/index.md")
+
     def test_default_source_from_a_subdirectory(self):
         self.dev()
         self.switch("dev")
@@ -210,6 +253,29 @@ class TestExport(Base):
         self.assertIn("docs: clarify intro", self.slice("log", "docs", cwd=src).stdout)
         self.slice("update", "docs", cwd=src)
         self.assertEqual(self.proposed(BRANCH), ["docs/feature.md", "docs/index.md", "docs/old.md"])
+
+    def test_slice_name_with_a_comma(self):
+        self.dev()
+        self.slice("add", "api,docs", "docs/", "--base", "main")
+        self.slice("update", "api,docs", "--from", "dev")
+        self.later()
+        self.assertIn("1 file updated", self.slice("update", "api,docs", "--from", "dev").stdout)
+
+    def test_separate_git_directory(self):
+        store, tree = os.path.join(self.tmp, "store.git"), os.path.join(self.tmp, "tree")
+        os.makedirs(tree)
+        env = dict(self.env, GIT_DIR=store, GIT_WORK_TREE=tree)
+        self.git("init", "-q", "--bare", "-b", "main", store)
+        self.git("config", "core.bare", "false", env=env)
+        for branch, content in (("main", "intro\n"), ("dev", "intro, clarified\n")):
+            if branch == "dev":
+                self.git("switch", "-q", "-c", "dev", cwd=tree, env=env)
+            self.write({"docs/index.md": content}, cwd=tree)
+            self.git("add", "-A", cwd=tree, env=env)
+            self.git("commit", "-q", "-m", branch, cwd=tree, env=env)
+        self.slice("add", "docs", "docs/", "--base", "main", cwd=tree, env=env)
+        self.slice("update", "docs", cwd=tree, env=env)
+        self.assertEqual(self.git("show", BRANCH + ":docs/index.md", cwd=tree, env=env), "intro, clarified\n")
 
 
 class TestMeasurement(Base):
@@ -227,8 +293,7 @@ class TestMeasurement(Base):
         self.assertEqual(self.proposed(branch), ["docs/feature.md"])
 
     def test_missing_upstream_is_reported(self):
-        self.lineage()
-        self.git("config", "--unset", "pathslice.docs.upstream")
+        self.lineage(upstream=False)
         out = self.slice("status", "docs", "--from", "feature").stdout
         self.assertIn("feature shares commits with dev", out)
         self.assertIn("git config pathslice.docs.upstream BRANCH", out)
@@ -244,25 +309,60 @@ class TestMeasurement(Base):
         self.commit("Agree the shared wording", {"docs/shared.md": "agreed wording\n"})
         self.switch("dev")
         self.merge("main")
-        self.switch("feature")
-        self.merge("dev", resolve={"docs/shared.md": "agreed wording\n"})
-        self.switch("main")
         self.slice("add", "docs", "docs/", "--base", "main", "--upstream", "dev")
-        self.slice("update", "docs", "--from", "feature")
         branch = "pathslice/docs/feature"
-        self.assertEqual(self.proposed(branch), ["docs/feature.md"])
-        self.assertEqual(self.show(branch, "docs/shared.md"), "agreed wording\n")
+        for resolution, proposed in (("agreed wording\n", ["docs/feature.md"]),
+                                     ("agreed wording, with the feature\n", ["docs/feature.md", "docs/shared.md"])):
+            with self.subTest(resolution=resolution):
+                self.switch("feature")
+                self.merge("dev", resolve={"docs/shared.md": resolution})
+                self.switch("main")
+                self.slice("update", "docs", "--from", "feature", "--rebuild")
+                self.assertEqual(self.proposed(branch), proposed)
+                self.assertEqual(self.show(branch, "docs/shared.md"), resolution)
+                self.switch("feature")
+                self.git("reset", "-q", "--hard", "HEAD^")
+                self.switch("main")
 
-    def test_source_merged_into_its_upstream_keeps_its_export(self):
+    def test_changes_the_upstream_received_stay_in_the_export(self):
         self.lineage()
         self.slice("update", "docs", "--from", "feature")
         branch = "pathslice/docs/feature"
-        exported = self.sha(branch)
         self.switch("dev")
         self.merge("feature")
+        self.switch("feature")
+        self.merge("dev")
+        self.commit("feature: more documentation", {"docs/more.md": "more\n"})
         self.switch("main")
-        self.assertIn("is up to date", self.slice("update", "docs", "--from", "feature").stdout)
-        self.assertEqual(self.sha(branch), exported)
+        self.slice("update", "docs", "--from", "feature")
+        self.assertEqual(self.proposed(branch), ["docs/feature.md", "docs/more.md"])
+
+    def test_changes_that_build_on_the_upstream_are_left_out(self):
+        self.lineage()
+        self.switch("feature")
+        self.commit("feature: extend the interface", {"docs/api.md": "api, extended\n"})
+        self.switch("main")
+        out = self.slice("update", "docs", "--from", "feature").stdout
+        self.assertIn("not exported, because the changes build on dev changes that main lacks:\n  docs/api.md", out)
+        self.assertEqual(self.proposed("pathslice/docs/feature"), ["docs/feature.md"])
+
+    def test_added_paths_reach_the_export(self):
+        self.dev()
+        self.slice("update", "docs", "--from", "dev")
+        self.git("config", "--add", "pathslice.docs.path", "src/")
+        out = self.slice("update", "docs", "--from", "dev").stdout
+        self.assertIn("1 file updated", out)
+        self.assertNotIn("lacks", out)
+        self.assertEqual(self.show(BRANCH, "src/a.py"), "x=3\n")
+
+    def test_setting_an_upstream_removes_its_changes(self):
+        self.lineage(upstream=False)
+        self.slice("update", "docs", "--from", "feature")
+        branch = "pathslice/docs/feature"
+        self.assertEqual(self.proposed(branch), ["docs/api.md", "docs/feature.md"])
+        self.git("config", "pathslice.docs.upstream", "dev")
+        out = self.slice("update", "docs", "--from", "feature").stdout
+        self.assertNotIn("lacks", out)
         self.assertEqual(self.proposed(branch), ["docs/feature.md"])
 
     def test_base_changes_merged_into_the_source_are_not_conflicts(self):
@@ -310,9 +410,7 @@ class TestExportBranch(Base):
         self.dev()
         self.slice("update", "docs", "--from", "dev")
         first = self.sha(BRANCH)
-        self.switch("dev")
-        self.commit("docs: later note", {"docs/later.md": "later\n"})
-        self.switch("main")
+        self.later()
         self.assertIn("1 file updated", self.slice("update", "docs", "--from", "dev").stdout)
         self.assertEqual(self.sha(BRANCH + "^"), first)
         body = self.git("log", "-1", "--format=%B", BRANCH)
@@ -324,9 +422,8 @@ class TestExportBranch(Base):
         self.slice("update", "docs", "--from", "dev")
         self.switch(BRANCH)
         self.commit("Apply suggestion from review", {"docs/index.md": "intro, reviewed\n"})
-        self.switch("dev")
-        self.commit("docs: later note", {"docs/later.md": "later\n"})
         self.switch("main")
+        self.later()
         out = self.slice("update", "docs", "--from", "dev").stdout
         self.assertIn("has changes that dev lacks in:\n  docs/index.md", out)
         self.assertEqual(self.show(BRANCH, "docs/index.md"), "intro, reviewed\n")
@@ -334,9 +431,7 @@ class TestExportBranch(Base):
         updated = self.sha(BRANCH)
         self.assertIn("is up to date", self.slice("update", "docs", "--from", "dev").stdout)
         self.assertEqual(self.sha(BRANCH), updated)
-        self.switch("dev")
-        self.commit("docs: take the review suggestion", {"docs/index.md": "intro, reviewed\n"})
-        self.switch("main")
+        self.later("docs: take the review suggestion", {"docs/index.md": "intro, reviewed\n"})
         out = self.slice("update", "docs", "--from", "dev").stdout
         self.assertIn("is up to date", out)
         self.assertNotIn("lacks", out)
@@ -346,15 +441,28 @@ class TestExportBranch(Base):
         self.slice("update", "docs", "--from", "dev")
         self.switch(BRANCH)
         self.commit("Apply suggestion from review", {"docs/index.md": "review wording\n"})
-        self.switch("dev")
-        self.commit("docs: rewrite intro", {"docs/index.md": "intro, rewritten\n"})
         self.switch("main")
+        self.later("docs: rewrite intro", {"docs/index.md": "intro, rewritten\n"})
         p = self.slice("update", "docs", "--from", "dev", check=False)
         self.assertEqual(p.returncode, 1)
         self.assertIn("conflict with its new changes in:\n  docs/index.md", p.stderr)
         self.slice("update", "docs", "--from", "dev", "--rebuild")
         self.assertEqual(self.sha(BRANCH + "^"), self.sha("main"))
         self.assertEqual(self.show(BRANCH, "docs/index.md"), "intro, rewritten\n")
+
+    def test_rebuild_with_nothing_to_export_starts_at_the_base(self):
+        self.dev()
+        self.slice("update", "docs", "--from", "dev")
+        self.switch(BRANCH)
+        self.commit("Apply suggestion from review", {"docs/index.md": "intro, reviewed\n"})
+        self.switch("main")
+        self.later("docs: withdraw the changes", {"docs/index.md": "intro\n", "docs/old.md": "old page\n",
+                                                  "docs/feature.md": None})
+        p = self.slice("update", "docs", "--from", "dev", check=False)
+        self.assertIn("--rebuild", p.stderr)
+        self.assertIn("with nothing to export", self.slice("update", "docs", "--from", "dev", "--rebuild").stdout)
+        self.assertEqual(self.sha(BRANCH), self.sha("main"))
+        self.assertIn("nothing to export", self.slice("update", "docs", "--from", "dev").stdout)
 
     def test_merged_export_starts_again_from_the_base(self):
         self.dev()
@@ -363,9 +471,7 @@ class TestExportBranch(Base):
         self.merge(BRANCH)
         self.assertIn("nothing to export", self.slice("update", "docs", "--from", "dev").stdout)
         self.assertEqual(self.sha(BRANCH), exported)
-        self.switch("dev")
-        self.commit("docs: later note", {"docs/later.md": "later\n"})
-        self.switch("main")
+        self.later()
         self.slice("update", "docs", "--from", "dev")
         self.assertEqual(self.sha(BRANCH + "^"), self.sha("main"))
         self.assertEqual(self.proposed(BRANCH), ["docs/later.md"])
@@ -379,9 +485,10 @@ class TestExportBranch(Base):
         self.git("merge", "-q", "--squash", BRANCH)
         self.git("commit", "-q", "-m", "Documentation (#7)")
         self.assertIn("nothing to export", self.slice("update", "docs", "--from", "dev").stdout)
-        self.switch("dev")
-        self.commit("docs: later note", {"docs/later.md": "later\n"})
-        self.switch("main")
+        self.commit("main: edit the intro again", {"docs/index.md": "intro, clarified and edited\n"})
+        out = self.slice("status", "docs", "--from", "dev").stdout
+        self.assertIn("nothing to export", out)
+        self.later()
         self.slice("update", "docs", "--from", "dev")
         self.assertEqual(self.sha(BRANCH + "^"), self.sha("main"))
         self.assertEqual(self.proposed(BRANCH), ["docs/later.md"])
@@ -394,6 +501,15 @@ class TestExportBranch(Base):
         self.commit("main: another page", {"docs/another.md": "another\n"})
         self.assertIn("is up to date", self.slice("update", "docs", "--from", "dev").stdout)
         self.assertEqual(self.sha(BRANCH), exported)
+
+    def test_conflicts_between_the_branch_and_the_base_are_reported(self):
+        self.dev()
+        self.slice("update", "docs", "--from", "dev")
+        self.commit("main: reword the intro", {"docs/index.md": "intro, reworded on main\n"})
+        out = self.slice("update", "docs", "--from", "dev").stdout
+        self.assertIn("is up to date", out)
+        self.assertIn("conflicts with main in:\n  docs/index.md", out)
+        self.assertIn("conflicts with main in:", self.slice("status", "docs", "--from", "dev").stdout)
 
     def test_branch_follows_a_newer_base_merged_into_the_source(self):
         self.dev()
@@ -409,15 +525,26 @@ class TestExportBranch(Base):
         self.assertEqual(self.proposed(BRANCH), ["docs/feature.md", "docs/index.md", "docs/later.md", "docs/old.md"])
         self.assertEqual(self.show(BRANCH, "docs/changelog.md"), "changelog, edited\n")
 
+    def test_withdrawn_changes_leave_an_empty_branch_that_is_not_merged(self):
+        self.dev()
+        self.slice("update", "docs", "--from", "dev")
+        self.later("docs: withdraw the changes", {"docs/index.md": "intro\n", "docs/old.md": "old page\n",
+                                                  "docs/feature.md": None})
+        self.assertIn("3 files updated", self.slice("update", "docs", "--from", "dev").stdout)
+        emptied = self.sha(BRANCH)
+        self.assertEqual(self.proposed(BRANCH), [])
+        self.assertIn("up to date", self.slice("status", "docs", "--from", "dev").stdout)
+        self.later()
+        self.slice("update", "docs", "--from", "dev")
+        self.assertEqual(self.sha(BRANCH + "^"), emptied)
+
 
 class TestBranchSafety(Base):
     def test_checked_out_export_branch_is_refused(self):
         self.dev()
         self.slice("update", "docs", "--from", "dev")
         self.git("worktree", "add", "-q", os.path.join(self.tmp, "other"), BRANCH)
-        self.switch("dev")
-        self.commit("docs: later note", {"docs/later.md": "later\n"})
-        self.switch("main")
+        self.later()
         p = self.slice("update", "docs", "--from", "dev", check=False)
         self.assertEqual(p.returncode, 1)
         self.assertIn("checked out", p.stderr)
@@ -431,12 +558,26 @@ class TestBranchSafety(Base):
 
     def test_ordinary_branch_is_not_taken_over(self):
         self.dev()
-        self.git("branch", "notes", "dev~1")
+        self.slice("update", "docs", "--from", "dev")
+        self.git("cherry-pick", BRANCH)
+        self.git("branch", "notes", "main")
+        self.switch("notes")
+        self.commit("Meeting notes", {"notes.txt": "notes\n"})
+        self.switch("main")
+        notes = self.sha("notes")
         for extra in ([], ["--rebuild"]):
             p = self.slice("update", "docs", "--from", "dev", "--branch", "notes", *extra, check=False)
             self.assertEqual(p.returncode, 1)
             self.assertIn("is not an export of slice docs", p.stderr)
-        self.assertEqual(self.sha("notes"), self.sha("dev~1"))
+        self.assertEqual(self.sha("notes"), notes)
+
+    def test_another_base_needs_another_branch(self):
+        self.dev()
+        self.slice("update", "docs", "--from", "dev")
+        self.git("branch", "release", "main~1")
+        p = self.slice("update", "docs", "--from", "dev", "--onto", "release", check=False)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("exports slice docs onto main", p.stderr)
 
     def test_custom_branch_is_remembered_and_follows_renames(self):
         self.dev()
@@ -454,18 +595,16 @@ class TestBranchSafety(Base):
     def test_export_made_by_version_0_2_is_continued(self):
         self.dev()
         source = self.sha("dev~1")
+        scope = hashlib.sha256(json.dumps(["docs", ["docs/"], "main"]).encode()).hexdigest()
         self.switch("specs-export", create=True, start="main")
-        self.commit("Add feature and documentation\n\nSliced-From: %s" % source,
+        self.commit("Add feature and documentation\n\nSliced-From: %s\nPathslice: %s %s" % (source, scope, source),
                     {"docs/index.md": "intro, clarified\n", "docs/feature.md": "feature\n", "docs/old.md": None})
         legacy = self.sha("HEAD")
         self.switch("main")
-        empty = self.git("hash-object", "-t", "tree", "-w", os.devnull).strip()
-        record = json.dumps({"slice": "docs", "source_ref": "dev", "branch": "specs-export"})
-        p = subprocess.run(["git", "commit-tree", empty, "-m", record], cwd=self.repo, env=self.env,
-                           stdout=subprocess.PIPE, check=True)
-        self.git("update-ref", "refs/pathslices/branches/specs-export", p.stdout.decode().strip())
-        self.switch("dev")
-        self.commit("docs: later note", {"docs/later.md": "later\n"})
+        self.legacy_record("specs-export")
+        self.later()
+        self.switch("specs-export")
+        self.assertIn("slice docs: dev -> main  (branch specs-export)", self.slice("status", "docs").stdout)
         self.switch("main")
         self.slice("update", "docs", "--from", "dev")
         self.assertEqual(self.sha("specs-export^"), legacy)
@@ -473,80 +612,205 @@ class TestBranchSafety(Base):
                          ["docs/feature.md", "docs/index.md", "docs/later.md", "docs/old.md"])
         self.assertIn("- docs: later note", self.git("log", "-1", "--format=%B", "specs-export"))
 
+    def test_several_version_0_2_exports_need_a_branch(self):
+        self.dev()
+        self.legacy_record("export-a")
+        self.legacy_record("export-b")
+        p = self.slice("update", "docs", "--from", "dev", check=False)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("several branches export slice docs from dev", p.stderr)
+
+    def test_stale_source_cannot_replace_a_newer_export(self):
+        self.dev()
+        bare = self.remote()
+        self.slice("update", "docs", "--from", "dev", "--push")
+        other = self.clone(bare)
+        self.git("branch", "dev", "origin/dev", cwd=other)
+        self.slice("add", "docs", "docs/", "--base", "main", cwd=other)
+        self.later()
+        self.git("push", "-q", "origin", "dev")
+        self.slice("update", "docs", "--from", "dev", "--push")
+        self.git("fetch", "-q", "origin", cwd=other)
+        p = self.slice("update", "docs", "--from", "dev", "--push", cwd=other, check=False)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("which is newer than dev", p.stderr)
+        self.assertEqual(self.git("rev-parse", BRANCH, cwd=bare).strip(), self.sha(BRANCH))
+
+    def test_missing_source_commit_stops_the_update(self):
+        self.dev()
+        bare = self.remote()
+        self.slice("update", "docs", "--from", "dev", "--push")
+        self.review(bare, {"docs/feature.md": "feature, reviewed\n"})
+        self.git("fetch", "-q", "origin")
+        self.later()
+        self.slice("update", "docs", "--from", "dev", "--push")
+        self.switch("dev")
+        self.git("commit", "-q", "--amend", "-m", "docs: later note, reworded")
+        self.git("push", "-q", "--force", "origin", "dev")
+        self.switch("main")
+        fresh = self.clone(bare, "--no-local")
+        self.git("branch", "dev", "origin/dev", cwd=fresh)
+        self.slice("add", "docs", "docs/", "--base", "main", cwd=fresh)
+        p = self.slice("update", "docs", "--from", "dev", cwd=fresh, check=False)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("which this repository does not have", p.stderr)
+
 
 class TestPublication(Base):
     def test_pushes_include_commits_added_on_the_remote(self):
         self.dev()
         bare = self.remote()
         self.assertIn("pushed %s to origin" % BRANCH, self.slice("update", "docs", "--from", "dev", "--push").stdout)
-        reviewer = self.clone(bare, "reviewer")
-        self.git("switch", "-q", BRANCH, cwd=reviewer)
-        self.commit("Apply suggestion from review", {"docs/feature.md": "feature, reviewed\n"}, cwd=reviewer)
-        self.git("push", "-q", "origin", BRANCH, cwd=reviewer)
-        self.switch("dev")
-        self.commit("docs: later note", {"docs/later.md": "later\n"})
-        self.switch("main")
+        self.review(bare, {"docs/feature.md": "feature, reviewed\n"})
+        self.later()
         self.git("fetch", "-q", "origin")
         self.slice("update", "docs", "--from", "dev", "--push")
-        pushed = self.git("rev-parse", BRANCH, cwd=bare).strip()
-        self.assertEqual(pushed, self.sha(BRANCH))
-        self.assertEqual(self.git("show", "%s:docs/feature.md" % BRANCH, cwd=bare), "feature, reviewed\n")
-        self.assertEqual(self.git("show", "%s:docs/later.md" % BRANCH, cwd=bare), "later\n")
+        self.assertEqual(self.git("rev-parse", BRANCH, cwd=bare).strip(), self.sha(BRANCH))
+        self.assertEqual(self.show(BRANCH, "docs/feature.md", cwd=bare), "feature, reviewed\n")
+        self.assertEqual(self.show(BRANCH, "docs/later.md", cwd=bare), "later\n")
         self.assertIn("already up to date", self.slice("update", "docs", "--from", "dev", "--push").stdout)
 
-    def test_rebuild_does_not_replace_unseen_remote_commits(self):
+    def test_rejected_push_can_be_retried(self):
+        self.dev()
+        bare = self.remote()
+        hook = os.path.join(bare, "hooks", "pre-receive")
+        with open(hook, "w") as f:
+            f.write("#!/bin/sh\nexit 1\n")
+        os.chmod(hook, 0o755)
+        self.assertNotEqual(self.slice("update", "docs", "--from", "dev", "--push", check=False).returncode, 0)
+        os.remove(hook)
+        self.slice("update", "docs", "--from", "dev", "--push")
+        self.assertEqual(self.git("rev-parse", BRANCH, cwd=bare).strip(), self.sha(BRANCH))
+
+    def test_remote_branch_deleted_after_its_merge(self):
         self.dev()
         bare = self.remote()
         self.slice("update", "docs", "--from", "dev", "--push")
-        reviewer = self.clone(bare, "reviewer")
-        self.git("switch", "-q", BRANCH, cwd=reviewer)
-        self.commit("Apply suggestion from review", {"docs/feature.md": "feature, reviewed\n"}, cwd=reviewer)
-        self.git("push", "-q", "origin", BRANCH, cwd=reviewer)
-        reviewed = self.git("rev-parse", BRANCH, cwd=bare).strip()
-        self.switch("dev")
-        self.commit("docs: later note", {"docs/later.md": "later\n"})
-        self.switch("main")
+        self.merge(BRANCH)
+        self.git("push", "-q", "origin", "main")
+        self.git("branch", "-D", BRANCH, cwd=bare)
+        self.later()
+        self.slice("update", "docs", "--from", "dev", "--push")
+        self.assertEqual(self.proposed(BRANCH), ["docs/later.md"])
+        self.assertEqual(self.git("rev-parse", BRANCH, cwd=bare).strip(), self.sha(BRANCH))
+
+    def test_branch_started_again_after_a_squash_merge_can_be_pushed_later(self):
+        self.dev()
+        bare = self.remote()
+        self.slice("update", "docs", "--from", "dev", "--push")
+        self.git("merge", "-q", "--squash", BRANCH)
+        self.git("commit", "-q", "-m", "Documentation (#7)")
+        self.git("push", "-q", "origin", "main")
+        self.later()
+        self.slice("update", "docs", "--from", "dev")
+        self.slice("update", "docs", "--from", "dev", "--push")
+        self.assertEqual(self.git("rev-parse", BRANCH, cwd=bare).strip(), self.sha(BRANCH))
+        self.assertEqual(self.proposed(BRANCH), ["docs/later.md"])
+
+    def test_unseen_remote_commits_are_not_replaced(self):
+        self.dev()
+        bare = self.remote()
+        self.slice("update", "docs", "--from", "dev", "--push")
+        reviewed = self.review(bare, {"docs/feature.md": "feature, reviewed\n"})
+        self.later()
         p = self.slice("update", "docs", "--from", "dev", "--rebuild", "--push", check=False)
         self.assertNotEqual(p.returncode, 0)
         self.assertEqual(self.git("rev-parse", BRANCH, cwd=bare).strip(), reviewed)
+
+    def test_unrecognised_remote_branch_is_refused(self):
+        self.dev()
+        bare = self.remote()
+        self.git("push", "-q", "origin", "main:refs/heads/" + BRANCH)
+        self.git("fetch", "-q", "origin")
+        p = self.slice("update", "docs", "--from", "dev", "--push", check=False)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("is not an export of slice docs", p.stderr)
+        self.assertEqual(self.git("rev-parse", BRANCH, cwd=bare).strip(), self.sha("main"))
 
     def test_publish_replaces_local_exports_with_the_remote_branch(self):
         self.dev()
         bare = self.remote()
         self.fake_gh()
         self.slice("update", "docs", "--from", "dev", "--push")
-        reviewer = self.clone(bare, "reviewer")
-        self.git("switch", "-q", BRANCH, cwd=reviewer)
-        self.commit("Apply suggestion from review", {"docs/feature.md": "feature, reviewed\n"}, cwd=reviewer)
-        self.git("push", "-q", "origin", BRANCH, cwd=reviewer)
-        self.switch("dev")
-        self.commit("docs: later note", {"docs/later.md": "later\n"})
-        self.switch("main")
+        self.review(bare, {"docs/feature.md": "feature, reviewed\n"})
+        self.later()
         self.slice("update", "docs", "--from", "dev")
         p = self.slice("publish", "docs", "--from", "dev")
         self.assertIn("replacing 1 local commit(s) made by git pathslice", p.stderr)
-        self.assertEqual(self.git("show", "%s:docs/feature.md" % BRANCH, cwd=bare), "feature, reviewed\n")
-        self.assertEqual(self.git("show", "%s:docs/later.md" % BRANCH, cwd=bare), "later\n")
+        self.assertEqual(self.show(BRANCH, "docs/feature.md", cwd=bare), "feature, reviewed\n")
+        self.assertEqual(self.show(BRANCH, "docs/later.md", cwd=bare), "later\n")
+
+    def test_amended_export_commit_is_kept(self):
+        self.dev()
+        bare = self.remote()
+        self.fake_gh()
+        self.slice("update", "docs", "--from", "dev", "--push")
+        self.review(bare, {"docs/feature.md": "feature, reviewed\n"})
+        self.switch(BRANCH)
+        self.write({"docs/index.md": "intro, amended\n"})
+        self.git("commit", "-q", "-a", "--amend", "--no-edit",
+                 env=dict(self.env, GIT_COMMITTER_DATE="@2000000000 +0000"))
+        amended = self.sha(BRANCH)
+        self.switch("main")
+        p = self.slice("publish", "docs", "--from", "dev", check=False)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("neither on origin/%s nor made by git pathslice" % BRANCH, p.stderr)
+        self.assertEqual(self.sha(BRANCH), amended)
+
+    def test_publish_without_update_keeps_the_local_branch(self):
+        self.dev()
+        bare = self.remote()
+        self.fake_gh()
+        self.slice("update", "docs", "--from", "dev", "--push")
+        reviewed = self.review(bare, {"docs/feature.md": "feature, reviewed\n"})
+        self.later()
+        self.slice("update", "docs", "--from", "dev")
+        local = self.sha(BRANCH)
+        p = self.slice("publish", "docs", "--from", "dev", "--no-update", check=False)
+        self.assertEqual(p.returncode, 1)
+        self.assertEqual(self.sha(BRANCH), local)
+        self.assertEqual(self.git("rev-parse", BRANCH, cwd=bare).strip(), reviewed)
+
+    def test_withdrawn_changes_are_published(self):
+        self.dev()
+        bare = self.remote()
+        self.fake_gh()
+        self.slice("publish", "docs", "--from", "dev")
+        self.later("docs: withdraw the changes", {"docs/index.md": "intro\n", "docs/old.md": "old page\n",
+                                                  "docs/feature.md": None})
+        self.assertIn("no changes remain", self.slice("publish", "docs", "--from", "dev").stdout)
+        self.assertEqual(self.git("rev-parse", BRANCH, cwd=bare).strip(), self.sha(BRANCH))
 
     def test_publish_creates_then_reuses_the_pull_request(self):
         self.dev()
         bare = self.remote()
         calls = self.fake_gh()
         self.slice("publish", "docs", "--from", "dev", "--branch", "review/docs", "--draft")
-        self.switch("dev")
-        self.commit("docs: later note", {"docs/later.md": "later\n"})
-        self.switch("main")
+        self.later()
         self.assertIn("using existing PR", self.slice("pr", "docs", "--from", "dev").stdout)
-        self.assertEqual(self.git("show", "review/docs:docs/later.md", cwd=bare), "later\n")
+        self.assertEqual(self.show("review/docs", "docs/later.md", cwd=bare), "later\n")
         self.env["GH_TEST_FAIL"] = "1"
         p = self.slice("publish", "docs", "--from", "dev", check=False)
         self.assertNotEqual(p.returncode, 0)
         self.assertIn("service unavailable", p.stderr)
-        with open(calls) as f:
-            commands = [json.loads(line) for line in f]
-        created = [cmd for cmd in commands if cmd[:2] == ["pr", "create"]]
+        created = [cmd for cmd in self.gh_calls(calls) if cmd[:2] == ["pr", "create"]]
         self.assertEqual(len(created), 1)
         self.assertIn("--draft", created[0])
+
+    def test_pull_request_after_a_merge_lists_only_new_commits(self):
+        self.dev()
+        self.remote()
+        calls = self.fake_gh()
+        self.slice("publish", "docs", "--from", "dev")
+        self.merge(BRANCH)
+        self.git("push", "-q", "origin", "main")
+        os.remove(calls.replace(".jsonl", ".created"))
+        self.later()
+        self.slice("publish", "docs", "--from", "dev")
+        body = [cmd for cmd in self.gh_calls(calls) if cmd[:2] == ["pr", "create"]][-1]
+        body = body[body.index("--body") + 1]
+        self.assertIn("docs: later note", body)
+        self.assertNotIn("clarify intro", body)
 
 
 class TestInspection(Base):
@@ -561,6 +825,15 @@ class TestInspection(Base):
         self.assertIn("source commits:", out)
         self.assertIn("docs: clarify intro", out)
         self.assertNotIn("code only", out)
+        self.assertIn("files in the export:\n    docs/feature.md\n    docs/index.md\n    docs/old.md", out)
+
+    def test_status_arguments_are_checked(self):
+        self.dev()
+        for args, message in ((["status", "nosuch", "--from", "dev"], "no slice named 'nosuch'"),
+                              (["status", "--from", "dev", "--branch", "x"], "--branch needs a slice name")):
+            p = self.slice(*args, check=False)
+            self.assertEqual(p.returncode, 1)
+            self.assertIn(message, p.stderr)
 
 
 if __name__ == "__main__":

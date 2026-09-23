@@ -65,8 +65,8 @@ rename, so later commands find the branch without `--branch`.
 
 | Command | Behaviour |
 | --- | --- |
-| `log docs` | List the source commits and files the export contains. |
-| `status` | Summarise each slice: whether the export branch is up to date, changes made on it that the source lacks, and conflicts. |
+| `log docs` | List the source commits and the files the export contains. |
+| `status` | Summarise each slice: whether the export branch is up to date, changes made on it that the source lacks, files left out, and conflicts. |
 | `update docs` | Update the export branch locally, without fetching. |
 | `update docs --push` | Update and push the export branch, without fetching or opening a PR. |
 
@@ -93,19 +93,30 @@ Without an upstream, changes the source merged from another branch are
 exported as its own. `status` reports when the source shares commits with
 other branches or merges commits that are not on the base.
 
-The upstream is expected to receive the source through a merge commit, a squash
-merge or a rebase merge, as GitHub performs them. If the upstream is
-fast-forwarded to the source, the source's changes are measured as already
-merged and the export appears empty.
+The upstream can merge the source, and the source can then merge the upstream
+again: the changes the upstream received from the source are taken out of the
+measure, so they stay in the export. If the upstream is fast-forwarded to the
+source instead, the source's changes are measured as the upstream's and the
+export appears empty.
 
 ## Updating an open pull request
 
 While the PR is open, commit to the source branch and run `publish` again.
 Each update adds one commit to the export branch. Earlier commits are not
 rewritten, so pushes are fast-forwards. The commit lists the source commits it
-covers, and the trailers `Pathslice-Slice` and `Pathslice-Source` identify the
-slice and the source commit. Identities and dates are taken from the source
-commit and the parents, so identical inputs produce identical commits.
+covers. Its trailers record the slice (`Pathslice-Slice`), the source commit
+(`Pathslice-Source`) and the definition used (`Pathslice-Base`,
+`Pathslice-Upstream` and `Pathslice-Path`). Identities and dates are taken
+from the source commit and the parents, so identical inputs produce identical
+commits.
+
+A change to the slice's paths or upstream takes effect at the next update,
+which compares the new export with the one made under the recorded definition.
+An export branch serves one base; choose another `--branch` for another base.
+An update stops if the source is behind the commit the branch was last
+exported from, as in a checkout that has not pulled. It also stops if that
+commit is missing, for example after the source was rewritten and pruned;
+`--rebuild` then starts the branch again.
 
 Commits added to the export branch, such as review suggestions applied on
 GitHub, are kept. `update` and `status` list the files in which the export
@@ -114,38 +125,53 @@ that both PRs agree. If such a change conflicts with a later source change,
 the update stops. Make the change in the source, or run with `--rebuild` to
 discard it.
 
-Changes to the base alone leave the export branch unchanged. If the source
-merges a newer base than the export branch holds, the next update commit also
-merges the base, so the PR still shows only the source's changes.
+Changes to the base alone leave the export branch unchanged; `update` and
+`status` report when the branch no longer merges cleanly into the base. If the
+source merges a newer base than the export branch holds, the next update commit
+also merges the base, so the PR still shows only the source's changes.
 
 After the PR is merged, by merge commit or squash, `update` reports that there
-is nothing to export. When the source has new changes, the next update starts
-again from the base.
+is nothing to export, and the changes it brought to the base count as merged
+even if the base later edits them. When the source has new changes, the next
+update starts again from the base. If the source withdraws all its changes
+before then, the update leaves the branch with none and `publish` pushes it, so
+the PR shows none.
 
 `--rebuild` starts the export branch again from the base, discarding its
-commits. The push uses a lease, as described below.
+commits; with nothing to export, it resets the branch to the base.
 
 ## Conflicts
 
-If the source's changes conflict with the base, `update` and `publish` stop and
-name the files. Merge the base into the source, resolve the conflicts there,
-then run the command again. The resolution then belongs to the source and
-reaches the export with the rest of its changes.
+If the source's changes conflict with changes the base made since the source
+last merged it, `update` and `publish` stop and name the files. Merge the base
+into the source, resolve the conflicts there, then run the command again. The
+resolution then belongs to the source and reaches the export with the rest of
+its changes.
+
+A conflict in a file the base has not changed since then comes from upstream
+changes that the base lacks, which merging the base cannot resolve. Such files
+are left at the base's version, and `update` and `status` list them. They are
+exported once the upstream changes they build on reach the base.
 
 ## Working with Git
 
 Pathslice installs no hooks. It refuses to update a branch that is checked out
 or used by a rebase or bisect, including in other worktrees. Neither the source
 nor the base can be the export branch. An existing branch is updated only if it
-holds a pathslice commit for the slice, holds commits made by version 0.2, or
-is recorded for the slice and source.
+is recorded for the slice and source, or if its commits that the base lacks
+include one pathslice made for the slice (with version 0.2, for the same paths
+and base).
 
-`publish` fetches first. If the local export branch and the remote branch have
-diverged, local commits made by pathslice are replaced by the remote history,
-since they are recomputed; any other local commit stops the command. `update`
-does not fetch, builds on the local branch and reports a divergence. Pushes use
-Git's `--force-with-lease` option with the last fetched value, so a remote
-branch that changed since the last fetch is not overwritten.
+When `publish` finds that the local export branch and the remote branch have
+diverged, local commits that pathslice made, and that still have the committer
+and date it gave them, are replaced by the remote history, since they are
+recomputed; any other local commit, including an amended one, stops the
+command. `update` builds on the local branch and reports a divergence.
+
+Pushes read the remote branch with `git ls-remote` and pass that value to Git's
+`--force-with-lease` option. A push that is not a fast-forward replaces only
+commits that were fetched and built on, or whose changes the base already
+holds.
 
 ## Upgrading from version 0.2
 

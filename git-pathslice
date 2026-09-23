@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -20,13 +21,20 @@ SHARED_FILE = ".gitpathslices"
 BRANCH_ROOT = "pathslice"
 SLICE_TRAILER = "Pathslice-Slice"
 SOURCE_TRAILER = "Pathslice-Source"
+BASE_TRAILER = "Pathslice-Base"
+UPSTREAM_TRAILER = "Pathslice-Upstream"
+PATH_TRAILER = "Pathslice-Path"
 LEGACY_TRAILER = "Sliced-From"
+LEGACY_SCOPE_TRAILER = "Pathslice"
 LEGACY_RECORDS = "refs/pathslices/branches/"
 MIN_GIT = (2, 40)
+# Settings that would change the output this script parses.
+GIT_OPTIONS = ("-c", "log.showSignature=false", "-c", "i18n.logOutputEncoding=UTF-8")
 # git merge-tree needs commits; these temporary commits are never referenced.
 SCRATCH_ENV = {"GIT_AUTHOR_NAME": "git-pathslice", "GIT_AUTHOR_EMAIL": "git-pathslice@invalid",
-               "GIT_AUTHOR_DATE": "1000000000 +0000", "GIT_COMMITTER_NAME": "git-pathslice",
-               "GIT_COMMITTER_EMAIL": "git-pathslice@invalid", "GIT_COMMITTER_DATE": "1000000000 +0000"}
+               "GIT_AUTHOR_DATE": "@1000000000 +0000", "GIT_COMMITTER_NAME": "git-pathslice",
+               "GIT_COMMITTER_EMAIL": "git-pathslice@invalid", "GIT_COMMITTER_DATE": "@1000000000 +0000"}
+UNNAMED_CONFLICT = "(a conflict git merge-tree reports without a file, such as a directory rename)"
 
 
 class SliceError(Exception):
@@ -38,14 +46,7 @@ def _b(s: str | bytes | None) -> bytes | None:
 
 
 def _s(b: bytes) -> str:
-    return b.decode("utf-8", "replace")
-
-
-def _clean_env() -> dict[str, str]:
-    env = dict(os.environ)
-    for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY"):
-        env.pop(k, None)
-    return env
+    return b.decode("utf-8", "surrogateescape")
 
 
 def short(sha: str) -> str:
@@ -60,48 +61,46 @@ class Repo:
         rc, out, err = self._exec(["rev-parse", "--show-toplevel"], os.getcwd())
         if rc != 0:
             raise SliceError("not inside a git work tree")
-        self.top = _s(out).strip()
-        self.common = os.path.abspath(os.path.join(self.top, self.run("rev-parse", "--git-common-dir").strip()))
-        self._empty_tree: str | None = None
+        self.top = _s(out).rstrip("\n")
+        self.common = os.path.abspath(os.path.join(self.top, self.run("rev-parse", "--git-common-dir").rstrip("\n")))
+        self.cache: dict[tuple[str, ...], str] = {}
 
     @staticmethod
     def _exec(args: list[str], cwd: str, input: str | bytes | None = None,
               env: dict[str, str] | None = None) -> tuple[int, bytes, bytes]:
-        p = subprocess.run(["git", *args], cwd=cwd, input=_b(input),
+        p = subprocess.run(["git", *GIT_OPTIONS, *args], cwd=cwd, input=_b(input),
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
         return p.returncode, p.stdout, p.stderr
 
     @overload
-    def try_run(self, *args: str, input: str | bytes | None = None, cwd: str | None = None,
+    def try_run(self, *args: str, input: str | bytes | None = None,
                 binary: Literal[False] = False, env_extra: dict[str, str] | None = None) -> tuple[int, str, str]: ...
 
     @overload
-    def try_run(self, *args: str, input: str | bytes | None = None, cwd: str | None = None,
+    def try_run(self, *args: str, input: str | bytes | None = None,
                 binary: Literal[True], env_extra: dict[str, str] | None = None) -> tuple[int, bytes, str]: ...
 
     @overload
-    def try_run(self, *args: str, input: str | bytes | None = None, cwd: str | None = None,
+    def try_run(self, *args: str, input: str | bytes | None = None,
                 binary: bool, env_extra: dict[str, str] | None = None) -> tuple[int, str | bytes, str]: ...
 
-    def try_run(self, *args: str, input: str | bytes | None = None, cwd: str | None = None,
+    def try_run(self, *args: str, input: str | bytes | None = None,
                 binary: bool = False, env_extra: dict[str, str] | None = None) -> tuple[int, str | bytes, str]:
-        env = _clean_env() if (cwd or env_extra) else None
-        if env is not None:
-            env.update(env_extra or {})
-        rc, out, err = self._exec(list(args), cwd or self.top, input, env)
+        env = {**os.environ, **env_extra} if env_extra else None
+        rc, out, err = self._exec(list(args), self.top, input, env)
         return rc, (out if binary else _s(out)), _s(err)
 
     @overload
-    def run(self, *args: str, input: str | bytes | None = None, cwd: str | None = None,
+    def run(self, *args: str, input: str | bytes | None = None,
             binary: Literal[False] = False, env_extra: dict[str, str] | None = None) -> str: ...
 
     @overload
-    def run(self, *args: str, input: str | bytes | None = None, cwd: str | None = None,
+    def run(self, *args: str, input: str | bytes | None = None,
             binary: Literal[True], env_extra: dict[str, str] | None = None) -> bytes: ...
 
-    def run(self, *args: str, input: str | bytes | None = None, cwd: str | None = None,
+    def run(self, *args: str, input: str | bytes | None = None,
             binary: bool = False, env_extra: dict[str, str] | None = None) -> str | bytes:
-        rc, out, err = self.try_run(*args, input=input, cwd=cwd, binary=binary, env_extra=env_extra)
+        rc, out, err = self.try_run(*args, input=input, binary=binary, env_extra=env_extra)
         if rc != 0:
             raise SliceError("git %s failed:\n%s" % (" ".join(args[:2]), err.strip()))
         return out
@@ -124,9 +123,9 @@ class Repo:
         return out.strip() if rc == 0 else None
 
     def empty_tree(self) -> str:
-        if self._empty_tree is None:
-            self._empty_tree = self.run("mktree", input="").strip()
-        return self._empty_tree
+        if ("empty",) not in self.cache:
+            self.cache[("empty",)] = self.run("mktree", input="").strip()
+        return self.cache[("empty",)]
 
     def current_branch(self) -> str | None:
         rc, out, _ = self.try_run("symbolic-ref", "--short", "-q", "HEAD")
@@ -177,8 +176,8 @@ class Slice:
     where: list[str] = field(default_factory=list)
 
 
-def _config_entries(repo: Repo, *source: str) -> list[tuple[str, str]]:
-    rc, out, err = repo.try_run("config", "-z", *source, "--get-regexp", r"^pathslice\.")
+def _config_entries(repo: Repo, regexp: str, *source: str) -> list[tuple[str, str]]:
+    rc, out, err = repo.try_run("config", "-z", *source, "--get-regexp", regexp)
     if rc == 1:
         return []
     if rc != 0:
@@ -202,7 +201,7 @@ def load_slices(repo: Repo, rev: str | None = None) -> dict[str, Slice]:
     for where, source in (("shared", shared), ("local", [])):
         if where == "shared" and not source:
             continue
-        for key, value in _config_entries(repo, *source):
+        for key, value in _config_entries(repo, r"^pathslice\.", *source):
             name, _, field_ = key[len("pathslice."):].rpartition(".")
             if not name:
                 continue
@@ -248,13 +247,20 @@ def normalise_path(repo: Repo, p: str) -> str:
     return p
 
 
+def legacy_scope(name: str, paths: list[str], base: str) -> str:
+    """The scope that git pathslice 0.2 recorded in its Pathslice trailers."""
+    return hashlib.sha256(json.dumps([name, paths, base], ensure_ascii=True).encode()).hexdigest()
+
+
 # Trees
 
 
 @contextmanager
 def _index() -> Iterator[dict[str, str]]:
+    # A split index would leave shared index files in the repository.
     with tempfile.TemporaryDirectory(prefix="pathslice-") as tmp:
-        yield {"GIT_INDEX_FILE": os.path.join(tmp, "index")}
+        yield {"GIT_INDEX_FILE": os.path.join(tmp, "index"), "GIT_CONFIG_COUNT": "1",
+               "GIT_CONFIG_KEY_0": "core.splitIndex", "GIT_CONFIG_VALUE_0": "false"}
 
 
 def _entries(repo: Repo, tree: str, paths: list[str]) -> bytes:
@@ -264,25 +270,46 @@ def _entries(repo: Repo, tree: str, paths: list[str]) -> bytes:
         return repo.run("ls-files", "--stage", "-z", "--", *paths, binary=True, env_extra=env)
 
 
-def replace_paths(repo: Repo, tree: str, donor: str, paths: list[str]) -> str:
-    """Return tree with the entries matching paths taken from donor."""
-    added = _entries(repo, donor, paths)
+def _rewrite(repo: Repo, tree: str, removed: list[bytes], added: bytes) -> str:
+    null = b"0" * len(repo.empty_tree())
     with _index() as env:
         repo.run("read-tree", tree, env_extra=env)
-        names = repo.run("ls-files", "-z", "--", *paths, binary=True, env_extra=env).split(b"\0")
-        null = b"0" * len(repo.empty_tree())
-        removed = b"".join(b"0 " + null + b"\t" + name + b"\0" for name in names if name)
-        if removed or added:
-            repo.run("update-index", "-z", "--index-info", input=removed + added, env_extra=env)
+        info = b"".join(b"0 " + null + b"\t" + name + b"\0" for name in removed) + added
+        if info:
+            repo.run("update-index", "-z", "--index-info", input=info, env_extra=env)
         return repo.run("write-tree", env_extra=env).strip()
 
 
+def replace_paths(repo: Repo, tree: str, donor: str, paths: list[str]) -> str:
+    """Return tree with the entries matching the pathspecs taken from donor."""
+    with _index() as env:
+        repo.run("read-tree", tree, env_extra=env)
+        names = repo.run("ls-files", "-z", "--", *paths, binary=True, env_extra=env).split(b"\0")
+    return _rewrite(repo, tree, [name for name in names if name], _entries(repo, donor, paths))
+
+
+def replace_names(repo: Repo, tree: str, donor: str, names: list[str]) -> str:
+    """Return tree with the named files taken from donor, matching the names exactly."""
+    wanted = sorted({os.fsencode(name) for name in names})
+    listing = repo.run("ls-tree", "-r", "-z", "--full-tree", donor, binary=True).split(b"\0")
+    added = b"".join(entry + b"\0" for entry in listing if entry.partition(b"\t")[2] in wanted)
+    return _rewrite(repo, tree, wanted, added)
+
+
 def slice_tree(repo: Repo, rev: str, paths: list[str]) -> str:
-    return replace_paths(repo, repo.empty_tree(), rev, paths)
+    key = ("slice", rev, *paths)
+    if key not in repo.cache:
+        repo.cache[key] = replace_paths(repo, repo.empty_tree(), rev, paths)
+    return repo.cache[key]
 
 
-def scratch_commit(repo: Repo, tree: str) -> str:
-    return repo.run("commit-tree", tree, input="git-pathslice\n", env_extra=SCRATCH_ENV).strip()
+def scratch_commit(repo: Repo, tree: str, parents: list[str] | None = None) -> str:
+    key = ("scratch", tree, *(parents or []))
+    if key not in repo.cache:
+        args = [arg for parent in parents or [] for arg in ("-p", parent)]
+        repo.cache[key] = repo.run("commit-tree", tree, *args, input="git-pathslice\n",
+                                   env_extra=SCRATCH_ENV).strip()
+    return repo.cache[key]
 
 
 def merge(repo: Repo, ours: str, theirs: str, base: str | None = None) -> tuple[str, list[str]]:
@@ -299,6 +326,8 @@ def merge(repo: Repo, ours: str, theirs: str, base: str | None = None) -> tuple[
         if not name:
             break
         conflicts.append(os.fsdecode(name))
+    if rc == 1 and not conflicts:
+        conflicts.append(UNNAMED_CONFLICT)
     return _s(fields[0]).strip(), conflicts
 
 
@@ -325,12 +354,19 @@ def last_merged(repo: Repo, ref: str, source: str) -> str | None:
     return None
 
 
-def measured_from(repo: Repo, paths: list[str], merged: list[str]) -> str:
-    """Slice tree that the source's changes are measured against.
+def merged_commits(repo: Repo, sl: Slice, source: str, base: str) -> list[tuple[str, str]]:
+    """The last commits source merged from the slice's upstream and base, upstream first."""
+    merged = []
+    upstream = [sl.upstream] if sl.upstream and sl.upstream != base else []
+    for ref in upstream + [base]:
+        sha = last_merged(repo, ref, source)
+        if sha:
+            merged.append((ref, sha))
+    return merged
 
-    merged lists the last commits the source merged from its upstream and its base, upstream
-    first. Where they conflict, the upstream's version is used.
-    """
+
+def measured_from(repo: Repo, paths: list[str], merged: list[str]) -> str:
+    """Slice tree of the merge of the given commits, upstream first; conflicts take the upstream's version."""
     commits = list(dict.fromkeys(merged))
     commits = [c for c in commits if not any(o != c and repo.is_ancestor(c, o) for o in commits)]
     if len(commits) == 1:
@@ -338,53 +374,160 @@ def measured_from(repo: Repo, paths: list[str], merged: list[str]) -> str:
     tree, conflicts = merge(repo, commits[0], commits[1])
     measured = slice_tree(repo, tree, paths)
     if conflicts:
-        measured = replace_paths(repo, measured, slice_tree(repo, commits[0], paths),
-                                 [":(literal)" + path for path in conflicts])
+        measured = replace_names(repo, measured, slice_tree(repo, commits[0], paths), conflicts)
     return measured
+
+
+def received_source(repo: Repo, sl: Slice, source: str, merged: list[tuple[str, str]]) -> str | None:
+    """The newest commit of the source's own history that the upstream's last merged commit contains."""
+    if len(merged) < 2:
+        return None
+    (upstream, upstream_merged), (_, base_merged) = merged[0], merged[-1]
+    contained = set(repo.run("rev-list", upstream_merged, "^" + base_merged).split())
+    upstream_tip = repo.rev(upstream)
+    if not contained or upstream_tip is None:
+        return None
+    # The source's own history ends where it reaches the upstream's first-parent chain or the base.
+    stop = set(repo.run("rev-list", "--first-parent", upstream_tip).split())
+    stop.update(repo.run("rev-list", base_merged).split())
+    for sha in repo.run("rev-list", "--first-parent", source).split():
+        if sha in stop:
+            return None
+        if sha in contained:
+            return sha
+    return None
+
+
+def measured_tree(repo: Repo, sl: Slice, source: str, merged: list[tuple[str, str]], depth: int = 0) -> str:
+    """Slice tree that the source's changes are measured against."""
+    tree = measured_from(repo, sl.paths, [sha for _, sha in merged])
+    received = received_source(repo, sl, source, merged)
+    if received is None:
+        return tree
+    if depth == 3:
+        raise SliceError("%s and %s have merged each other too often to separate the source's changes"
+                         % (short(source), sl.upstream))
+    # The upstream has merged part of the source: take that part out of the measure again.
+    earlier = measured_tree(repo, sl, received, merged_commits(repo, sl, received, merged[-1][0]), depth + 1)
+    tree, conflicts = merge(repo, scratch_commit(repo, tree), scratch_commit(repo, earlier),
+                            base=scratch_commit(repo, slice_tree(repo, received, sl.paths)))
+    if conflicts:
+        raise SliceError("%s merged %s at %s and has since changed the same parts of %s, so the source's changes "
+                         "cannot be separated from it; merge the export's pull request before merging %s into "
+                         "the source again" % (sl.upstream, short(source), short(received), ", ".join(conflicts),
+                                               sl.upstream))
+    return tree
+
+
+def export_target(repo: Repo, sl: Slice, source: str, merged: list[tuple[str, str]], export_base: str,
+                  landed_source: str | None = None) -> tuple[str, list[str], list[str]]:
+    """export_base's tree with the source's changes to the slice applied.
+
+    Also returns the conflicted paths, and the paths left at the base's version because the source's
+    changes to them build on upstream changes that the base lacks.
+    """
+    measured = measured_tree(repo, sl, source, merged)
+    if landed_source and repo.rev(landed_source) and repo.is_ancestor(landed_source, source):
+        # Changes that an earlier export has brought to the base count as merged.
+        earlier = measured_tree(repo, sl, landed_source, merged_commits(repo, sl, landed_source, merged[-1][0]))
+        adjusted, adjust_conflicts = merge(repo, scratch_commit(repo, measured),
+                                           scratch_commit(repo, slice_tree(repo, landed_source, sl.paths)),
+                                           base=scratch_commit(repo, earlier))
+        if not adjust_conflicts:
+            measured = adjusted
+    base_slice = slice_tree(repo, export_base, sl.paths)
+    changed, conflicts = merge(repo, scratch_commit(repo, base_slice),
+                               scratch_commit(repo, slice_tree(repo, source, sl.paths)),
+                               base=scratch_commit(repo, measured))
+    deferred: list[str] = []
+    if conflicts:
+        # A conflict in a file the base has not changed since the source last merged it comes from the upstream.
+        moved = set(diff_names(repo, slice_tree(repo, merged[-1][1], sl.paths), base_slice))
+        deferred = [path for path in conflicts if path != UNNAMED_CONFLICT and path not in moved]
+        conflicts = [path for path in conflicts if path not in deferred]
+        if deferred:
+            changed = replace_names(repo, changed, base_slice, deferred)
+    return replace_paths(repo, repo.tree(export_base), changed, sl.paths), conflicts, deferred
 
 
 # Export branches
 
+TRAILERS = (SLICE_TRAILER, SOURCE_TRAILER, BASE_TRAILER, UPSTREAM_TRAILER, PATH_TRAILER,
+            LEGACY_TRAILER, LEGACY_SCOPE_TRAILER)
 TRAILER_FORMAT = "%H%x1f%P" + "".join(
-    "%%x1f%%(trailers:key=%s,valueonly,unfold,separator=%%x2c)" % key
-    for key in (SLICE_TRAILER, SOURCE_TRAILER, LEGACY_TRAILER))
+    "%%x1f%%(trailers:key=%s,valueonly,unfold,separator=%%x1d)" % key for key in TRAILERS)
 
 
 @dataclass
 class Meta:
     sha: str
     parents: list[str]
-    slices: list[str]
-    source: str
-    legacy: str
+    trailers: dict[str, list[str]]
 
-    def made_for(self, name: str) -> bool:
-        return name in self.slices or bool(self.legacy)
+    def values(self, key: str) -> list[str]:
+        return self.trailers.get(key, [])
+
+    def first(self, key: str) -> str:
+        values = self.values(key)
+        return values[0] if values else ""
+
+    @property
+    def legacy(self) -> bool:
+        return bool(self.values(LEGACY_TRAILER))
+
+    @property
+    def source(self) -> str | None:
+        """The source commit this export commit was made from."""
+        if self.legacy:
+            return self.first(LEGACY_TRAILER) or None
+        return self.first(SOURCE_TRAILER).rpartition(" ")[2] or None
+
+    def made_for(self, name: str, scope: str) -> bool:
+        return name in self.values(SLICE_TRAILER) or any(
+            value.split()[:1] == [scope] for value in self.values(LEGACY_SCOPE_TRAILER))
 
 
 def commit_meta(repo: Repo, *revs: str) -> list[Meta]:
     metas = []
-    for line in repo.run("log", "--format=" + TRAILER_FORMAT, *revs).splitlines():
+    for line in repo.run("log", "--format=" + TRAILER_FORMAT, *revs).split("\n"):
         parts = line.split("\x1f")
-        if len(parts) == 5:
-            metas.append(Meta(parts[0], parts[1].split(), [s.strip() for s in parts[2].split(",") if s.strip()],
-                              parts[3].strip(), parts[4].strip()))
+        if len(parts) == 2 + len(TRAILERS):
+            trailers = {key: [v.strip() for v in value.split("\x1d") if v.strip()]
+                        for key, value in zip(TRAILERS, parts[2:])}
+            metas.append(Meta(parts[0], parts[1].split(), trailers))
     return metas
+
+
+def commit_identity(repo: Repo, source: str, parents: list[str]) -> dict[str, str]:
+    """Take identities from the source so that identical inputs produce identical commits."""
+    an, ae, ad, cn, ce, cd = repo.run("log", "-1", "--date=raw", "--format=%an%x1f%ae%x1f%ad%x1f%cn%x1f%ce%x1f%cd",
+                                      source).strip().split("\x1f")
+    dates = [cd] + [repo.run("log", "-1", "--date=raw", "--format=%cd", p).strip() for p in parents]
+    return {"GIT_AUTHOR_NAME": an, "GIT_AUTHOR_EMAIL": ae, "GIT_AUTHOR_DATE": "@" + ad,
+            "GIT_COMMITTER_NAME": cn, "GIT_COMMITTER_EMAIL": ce,
+            "GIT_COMMITTER_DATE": "@" + max(dates, key=lambda date: int(date.split()[0]))}
+
+
+def derived(repo: Repo, meta: Meta, name: str, scope: str) -> bool:
+    """Whether a commit is exactly as git pathslice made it, so that it can be made again."""
+    if not meta.made_for(name, scope) or not meta.source or not repo.rev(meta.source):
+        return False
+    committer = "--format=%cn%x1f%ce%x1f%cd"
+    actual = repo.run("log", "-1", "--date=raw", committer, meta.sha).strip()
+    if meta.legacy:
+        # Version 0.2 gave each replayed commit its source commit's committer.
+        return actual == repo.run("log", "-1", "--date=raw", committer, meta.source).strip()
+    env = commit_identity(repo, meta.source, meta.parents)
+    return actual == "\x1f".join((env["GIT_COMMITTER_NAME"], env["GIT_COMMITTER_EMAIL"],
+                                  env["GIT_COMMITTER_DATE"][1:]))
 
 
 def branch_mappings(repo: Repo) -> dict[str, dict[str, str]]:
     """Export branches recorded in branch.<name>.pathsliceSlice and pathsliceSource."""
-    rc, out, err = repo.try_run("config", "-z", "--get-regexp", r"^branch\..*\.pathslice(slice|source)$")
-    if rc == 1:
-        return {}
-    if rc != 0:
-        raise SliceError(err.strip())
     found: dict[str, dict[str, str]] = {}
-    for item in out.split("\0"):
-        if item:
-            key, _, value = item.partition("\n")
-            branch, _, var = key[len("branch."):].rpartition(".")
-            found.setdefault(branch, {})[var] = value
+    for key, value in _config_entries(repo, r"^branch\..*\.pathslice(slice|source)$"):
+        branch, _, var = key[len("branch."):].rpartition(".")
+        found.setdefault(branch, {})[var] = value
     return found
 
 
@@ -394,19 +537,17 @@ def record_branch(repo: Repo, branch: str, name: str, frm: str) -> None:
         repo.run("config", "--local", "branch.%s.pathsliceSource" % branch, frm)
 
 
-def legacy_branches(repo: Repo, name: str, frm: str) -> list[str]:
-    """Branches recorded by git pathslice 0.2 for this slice and source."""
-    found = []
-    for ref in repo.run("for-each-ref", "--format=%(refname)", LEGACY_RECORDS).splitlines():
+def legacy_records(repo: Repo) -> list[dict[str, str]]:
+    """Branch records written by git pathslice 0.2."""
+    records = []
+    for text in repo.run("for-each-ref", "--format=%(contents)%00", LEGACY_RECORDS).split("\0"):
         try:
-            record = json.loads(repo.run("log", "-1", "--format=%B", ref))
+            record = json.loads(text)
         except ValueError:
             continue
-        if isinstance(record, dict) and record.get("slice") == name and record.get("source_ref") == frm:
-            branch = record.get("branch")
-            if isinstance(branch, str):
-                found.append(branch)
-    return found
+        if isinstance(record, dict) and all(isinstance(record.get(k), str) for k in ("slice", "source_ref", "branch")):
+            records.append({k: record[k] for k in ("slice", "source_ref", "branch")})
+    return records
 
 
 def branch_name(name: str, frm: str) -> str:
@@ -418,24 +559,29 @@ def resolve_branch(repo: Repo, name: str, frm: str, branch: str | None = None) -
         return branch
     mapped = sorted(b for b, m in branch_mappings(repo).items()
                     if m.get("pathsliceslice") == name and m.get("pathslicesource") == frm)
+    if not mapped:
+        mapped = sorted({r["branch"] for r in legacy_records(repo) if (r["slice"], r["source_ref"]) == (name, frm)})
     if len(mapped) > 1:
         raise SliceError("several branches export slice %s from %s (%s); choose one with --branch"
                          % (name, frm, ", ".join(mapped)))
-    if mapped:
-        return mapped[0]
-    legacy = legacy_branches(repo, name, frm)
-    return legacy[0] if len(legacy) == 1 else branch_name(name, frm)
+    return mapped[0] if mapped else branch_name(name, frm)
+
+
+def _branch_part(repo: Repo, ref: str) -> str:
+    """The branch name in refs/heads/<name> or refs/remotes/<remote>/<name>."""
+    if ref.startswith("refs/heads/"):
+        return ref[len("refs/heads/"):]
+    for remote in sorted(repo.run("remote").splitlines(), key=len, reverse=True):
+        prefix = "refs/remotes/" + remote + "/"
+        if ref.startswith(prefix):
+            return ref[len(prefix):]
+    return ref
 
 
 def _local_branch_ref(repo: Repo, revision: str) -> str:
     rc, out, _ = repo.try_run("rev-parse", "--symbolic-full-name", "--verify", "--quiet", revision)
     ref = out.strip() if rc == 0 else ""
-    if ref.startswith("refs/remotes/"):
-        for remote in sorted(repo.run("remote").splitlines(), key=len, reverse=True):
-            prefix = "refs/remotes/" + remote + "/"
-            if ref.startswith(prefix):
-                return "refs/heads/" + ref[len(prefix):]
-    return ref
+    return "refs/heads/" + _branch_part(repo, ref) if ref.startswith("refs/remotes/") else ref
 
 
 def check_branch_name(repo: Repo, branch: str, frm: str, base: str) -> None:
@@ -454,13 +600,12 @@ class Export:
     remote: str | None
     remote_tip: str | None
     tip: str | None = None
-    previous: str | None = None
-    previous_source: str | None = None
-    legacy: bool = False
+    previous: Meta | None = None
+    last: Meta | None = None
     notes: list[str] = field(default_factory=list)
 
 
-def _choose_tip(repo: Repo, ex: Export, name: str, fetched: bool) -> str | None:
+def _choose_tip(repo: Repo, ex: Export, name: str, scope: str, base_tip: str, fetched: bool) -> str | None:
     """The commit the update builds on: the local branch or its remote-tracking branch."""
     local, remote_tip = ex.local, ex.remote_tip
     if not remote_tip or local == remote_tip:
@@ -473,40 +618,56 @@ def _choose_tip(repo: Repo, ex: Export, name: str, fetched: bool) -> str | None:
     if not fetched:
         ex.notes.append("%s and %s have diverged; publish reconciles them" % (ex.branch, remote_branch))
         return local
-    own = commit_meta(repo, local, "^" + remote_tip)
-    if all(meta.made_for(name) for meta in own):
-        # Commits made by pathslice are derived from the source and are made again.
+    own = commit_meta(repo, local, "^" + remote_tip, "^" + base_tip)
+    if all(derived(repo, meta, name, scope) for meta in own):
         ex.notes.append("replacing %d local commit(s) made by git pathslice with %s" % (len(own), remote_branch))
         return remote_tip
     raise SliceError("%s has commits that are neither on %s nor made by git pathslice; push or remove them first"
                      % (ex.branch, remote_branch))
 
 
-def read_export(repo: Repo, sl: Slice, frm: str, branch: str, base_tip: str,
+def read_export(repo: Repo, sl: Slice, frm: str, branch: str, base: str, base_tip: str,
                 remote: str | None, fetched: bool) -> Export:
     local = repo.rev("refs/heads/" + branch)
     remote_tip = repo.rev("refs/remotes/%s/%s" % (remote, branch)) if remote else None
     ex = Export(branch, local, remote, remote_tip)
-    ex.tip = _choose_tip(repo, ex, sl.name, fetched)
+    scope = legacy_scope(sl.name, sl.paths, base)
+    ex.tip = _choose_tip(repo, ex, sl.name, scope, base_tip, fetched)
     if ex.tip is None:
         return ex
-    stop = repo.merge_base(ex.tip, base_tip)
-    # A branch already merged into the base is searched for the export it last received.
-    revs = [ex.tip, "^" + stop] if stop and stop != ex.tip else ["-n", "100", ex.tip]
-    for meta in commit_meta(repo, "--first-parent", *revs):
-        if sl.name in meta.slices:
-            ex.previous, ex.previous_source = meta.sha, meta.source.rpartition(" ")[2] or None
+    for meta in commit_meta(repo, "--first-parent", ex.tip, "^" + base_tip):
+        if meta.made_for(sl.name, scope) and (not meta.legacy or len(meta.parents) < 2):
+            ex.previous = meta
             break
-        if meta.legacy and len(meta.parents) < 2:
-            # git pathslice 0.2 replayed one commit per source commit, naming it in Sliced-From.
-            ex.previous, ex.previous_source, ex.legacy = meta.sha, meta.legacy.split(",")[0], True
-            break
+    # A branch already merged into the base ends with the export commit it last received.
+    ex.last = ex.previous or next((meta for meta in commit_meta(repo, "-1", ex.tip)
+                                   if meta.made_for(sl.name, scope)), None)
     mapping = branch_mappings(repo).get(branch, {})
-    known = (mapping.get("pathsliceslice"), mapping.get("pathslicesource")) == (sl.name, frm)
-    if not (known or ex.previous
-            or any(meta.made_for(sl.name) for meta in commit_meta(repo, "--first-parent", "-n", "100", ex.tip))):
+    known = ((mapping.get("pathsliceslice"), mapping.get("pathslicesource")) == (sl.name, frm)
+             or any((r["slice"], r["source_ref"], r["branch"]) == (sl.name, frm, branch) for r in legacy_records(repo)))
+    if not (known or ex.last):
         raise SliceError("branch %s is not an export of slice %s; choose another --branch" % (branch, sl.name))
     return ex
+
+
+def export_landed(repo: Repo, tip: str, base_tip: str) -> bool:
+    """Whether the base holds the export branch's changes, through its commits or through others."""
+    if repo.is_ancestor(tip, base_tip):
+        return True
+    fork = repo.merge_base(tip, base_tip)
+    changed = diff_names(repo, fork, tip) if fork else []
+    if not changed:
+        return False
+    merged_tree, conflicts = merge(repo, base_tip, tip)
+    if not conflicts and merged_tree == repo.tree(base_tip):
+        return True
+    # A squash merge, possibly followed by further changes to the same files.
+    assert fork is not None
+    literal = [":(literal)" + path for path in changed]
+    for sha in repo.run("rev-list", "-n", "50", "--first-parent", base_tip, "^" + fork, "--", *literal).split():
+        if repo.try_run("diff", "--quiet", sha, tip, "--", *literal)[0] == 0:
+            return True
+    return False
 
 
 # Plans
@@ -523,83 +684,47 @@ class Plan:
     export: Export
     fresh: bool
     landed: bool
+    export_base: str
     parents: list[str]
-    target: str
     result: str
     conflicts: list[str]
+    deferred: list[str]
     export_conflicts: list[str]
     export_only: list[str]
-    hint: str | None
+    base_conflicts: list[str]
 
     @property
     def branch(self) -> str:
         return self.export.branch
 
 
-def _upstream_hint(repo: Repo, sl: Slice, frm: str, source: str, base: str, base_merged: str) -> str | None:
-    if sl.upstream:
-        return None
-    chain = repo.run("rev-list", "--first-parent", "--parents", source, "^" + base_merged).splitlines()
-    if not chain:
-        return None
-    advice = ("if it is developed against another branch, set that branch as the upstream: "
-              "git config pathslice.%s.upstream BRANCH" % sl.name)
-    own = re.compile(r"refs/(heads|remotes/[^/]+)/%s$" % re.escape(frm))
-    others = [ref.split("/", 2)[2] for ref in repo.run("for-each-ref", "--format=%(refname)", "--contains",
-                                                       chain[-1].split()[0], "refs/heads", "refs/remotes").splitlines()
-              if not own.match(ref) and not ref.endswith("/HEAD")]
-    # Integration branches such as dev usually have the shortest names.
-    others.sort(key=lambda name: (len(name.rsplit("/", 1)[-1]), name))
-    if others:
-        return "%s shares commits with %s; %s" % (frm, ", ".join(others[:3]) + (", ..." if len(others) > 3 else ""),
-                                                 advice)
-    base_tip = repo.rev(base) or base_merged
-    if any(not repo.is_ancestor(parent, base_tip) for line in chain for parent in line.split()[2:]):
-        return "%s merges commits that are not on %s; %s" % (frm, base, advice)
-    return None
-
-
-def merged_commits(repo: Repo, sl: Slice, source: str, base: str) -> list[tuple[str, str]]:
-    """The last commits source merged from the slice's upstream and base, upstream first."""
-    merged = []
-    upstream = [sl.upstream] if sl.upstream and sl.upstream != base else []
-    for ref in upstream + [base]:
-        sha = last_merged(repo, ref, source)
-        if sha:
-            merged.append((ref, sha))
-    return merged
-
-
-def export_target(repo: Repo, sl: Slice, source: str, merged: list[str], export_base: str) -> tuple[str, list[str]]:
-    """export_base's tree with the source's changes to the slice applied, and any conflicted paths."""
-    changed, conflicts = merge(repo, scratch_commit(repo, slice_tree(repo, export_base, sl.paths)),
-                               scratch_commit(repo, slice_tree(repo, source, sl.paths)),
-                               base=scratch_commit(repo, measured_from(repo, sl.paths, merged)))
-    return replace_paths(repo, repo.tree(export_base), changed, sl.paths), conflicts
-
-
 def previous_target(repo: Repo, sl: Slice, ex: Export, base: str, base_tip: str) -> str:
     """The tree the export branch was last given, without changes made on the branch since."""
     assert ex.tip is not None
-    if ex.previous is None:
+    prev = ex.previous
+    if prev is None:
         return repo.tree(repo.merge_base(ex.tip, base_tip) or ex.tip)
-    source = repo.rev(ex.previous_source) if ex.previous_source and not ex.legacy else None
-    export_base = repo.merge_base(ex.previous, base_tip)
-    if source and export_base:
-        # A pathslice commit also carries the branch's own changes, so recompute what it exported.
-        merged = merged_commits(repo, sl, source, base)
-        if merged:
-            tree, conflicts = export_target(repo, sl, source, [sha for _, sha in merged], export_base)
-            if not conflicts:
-                return tree
-    return repo.tree(ex.previous)
+    if prev.legacy:
+        return repo.tree(prev.sha)
+    source = repo.rev(prev.source) if prev.source else None
+    if source is None:
+        raise SliceError("%s was last exported from %s, which this repository does not have; fetch it, or run "
+                         "with --rebuild to start the branch again" % (ex.branch, short(prev.source or "?")))
+    # Recompute the export with the definition it was made with, which the commit records.
+    old_base = prev.first(BASE_TRAILER) or base
+    old = Slice(sl.name, prev.values(PATH_TRAILER) or sl.paths, old_base, prev.first(UPSTREAM_TRAILER) or None)
+    export_base = repo.merge_base(prev.sha, base_tip)
+    merged = merged_commits(repo, old, source, old_base)
+    if export_base and merged:
+        tree, conflicts, _ = export_target(repo, old, source, merged, export_base)
+        if not conflicts:
+            return tree
+    raise SliceError("cannot recompute what %s last exported; run with --rebuild to start it again" % ex.branch)
 
 
 def make_plan(repo: Repo, sl: Slice, frm: str, base: str | None = None, branch: str | None = None,
               remote: str | None = None, fetched: bool = False, rebuild: bool = False) -> Plan:
-    source = repo.rev(frm)
-    if source is None:
-        raise SliceError("%s does not name a commit" % frm)
+    source = _source(repo, frm)
     base = base or sl.base or default_base(repo)
     base_tip = repo.rev(base)
     if base_tip is None:
@@ -609,12 +734,17 @@ def make_plan(repo: Repo, sl: Slice, frm: str, base: str | None = None, branch: 
         raise SliceError("%s shares no history with %s" % (frm, base))
     name = resolve_branch(repo, sl.name, frm, branch)
     check_branch_name(repo, name, frm, base)
-    ex = read_export(repo, sl, frm, name, base_tip, remote, fetched)
-    landed = ex.tip is not None and not rebuild and repo.is_ancestor(ex.tip, base_tip)
-    if ex.tip is not None and not rebuild and not landed:
-        merged_tree, merge_conflicts = merge(repo, base_tip, ex.tip)
-        # The base can hold the branch's changes without its commits, for example after a squash merge.
-        landed = not merge_conflicts and not diff_names(repo, repo.tree(base_tip), merged_tree)
+    ex = read_export(repo, sl, frm, name, base, base_tip, remote, fetched)
+    if ex.last and not rebuild:
+        recorded = ex.last.first(BASE_TRAILER)
+        if recorded and recorded != base:
+            raise SliceError("branch %s exports slice %s onto %s; choose another --branch for %s, or run with "
+                             "--rebuild" % (name, sl.name, recorded, base))
+        previous = ex.previous.source if ex.previous else None
+        if previous and previous != source and repo.rev(previous) and repo.is_ancestor(source, previous):
+            raise SliceError("%s was last exported from %s, which is newer than %s; update %s and run this "
+                             "command again" % (name, short(previous), frm, frm))
+    landed = ex.tip is not None and not rebuild and export_landed(repo, ex.tip, base_tip)
     fresh = rebuild or ex.tip is None or landed
     export_base, parents = base_tip, [base_tip]
     if not fresh:
@@ -623,23 +753,26 @@ def make_plan(repo: Repo, sl: Slice, frm: str, base: str | None = None, branch: 
         if not repo.is_ancestor(merged[-1][1], export_base):
             # The source has merged a newer base than the export branch holds.
             export_base, parents = base_tip, [ex.tip, base_tip]
-    target, conflicts = export_target(repo, sl, source, [sha for _, sha in merged], export_base)
+    landed_source = ex.last.source if landed and ex.last else None
+    target, conflicts, deferred = export_target(repo, sl, source, merged, export_base, landed_source)
     result = target
     export_conflicts: list[str] = []
     export_only: list[str] = []
+    base_conflicts: list[str] = []
     if not fresh and not conflicts:
         assert ex.tip is not None
-        previous = previous_target(repo, sl, ex, base, base_tip)
-        if previous != repo.tree(ex.tip):
+        previous_tree = previous_target(repo, sl, ex, base, base_tip)
+        if previous_tree != repo.tree(ex.tip):
             # Keep changes made on the export branch since it was exported, such as review suggestions.
             result, export_conflicts = merge(repo, ex.tip, scratch_commit(repo, target),
-                                             base=scratch_commit(repo, previous))
+                                             base=scratch_commit(repo, previous_tree))
         if not export_conflicts:
             export_only = diff_names(repo, target, result)
+            _, base_conflicts = merge(repo, base_tip, scratch_commit(repo, result, parents))
     return Plan(sl=sl, frm=frm, source=source, base=base, base_tip=base_tip, merged=merged, export=ex,
-                fresh=fresh, landed=landed, parents=parents, target=target, result=result, conflicts=conflicts,
-                export_conflicts=export_conflicts, export_only=export_only,
-                hint=_upstream_hint(repo, sl, frm, source, base, merged[-1][1]))
+                fresh=fresh, landed=landed, export_base=export_base, parents=parents, result=result,
+                conflicts=conflicts, deferred=deferred, export_conflicts=export_conflicts,
+                export_only=export_only, base_conflicts=base_conflicts)
 
 
 def source_commits(repo: Repo, plan: Plan, since: str | None = None) -> list[tuple[str, str]]:
@@ -647,28 +780,29 @@ def source_commits(repo: Repo, plan: Plan, since: str | None = None) -> list[tup
     if since and repo.rev(since):
         excludes.append("^" + since)
     out = repo.run("log", "--reverse", "--format=%H%x1f%s", plan.source, *excludes, "--", *plan.sl.paths)
-    return [(sha, subject) for sha, _, subject in (line.partition("\x1f") for line in out.splitlines())]
+    return [(sha, subject) for sha, _, subject in (line.partition("\x1f") for line in out.split("\n") if line)]
+
+
+def exported_since(plan: Plan, landed_only: bool = False) -> str | None:
+    """The source of the export commit that the listed source commits follow."""
+    last = plan.export.last
+    if last is None or not (plan.landed or (not plan.fresh and not landed_only)):
+        return None
+    return last.source
 
 
 def commit_message(repo: Repo, plan: Plan) -> str:
-    since = plan.export.previous_source if plan.landed or not plan.fresh else None
-    listed = ["- %s (%s)" % (subject, short(sha)) for sha, subject in source_commits(repo, plan, since)]
+    listed = ["- %s (%s)" % (subject, short(sha)) for sha, subject in source_commits(repo, plan, exported_since(plan))]
     lines = ["%s: %s from %s" % (plan.sl.name, "export" if plan.fresh else "update", plan.frm), ""]
     lines += listed or ["No new commit on %s changes these paths directly." % plan.frm]
     if len(plan.parents) > 1:
         lines += ["", "Follows %s at %s." % (plan.base, short(plan.base_tip))]
-    lines += ["", "%s: %s" % (SLICE_TRAILER, plan.sl.name), "%s: %s %s" % (SOURCE_TRAILER, plan.frm, plan.source)]
+    lines += ["", "%s: %s" % (SLICE_TRAILER, plan.sl.name), "%s: %s %s" % (SOURCE_TRAILER, plan.frm, plan.source),
+              "%s: %s" % (BASE_TRAILER, plan.base)]
+    if plan.sl.upstream:
+        lines.append("%s: %s" % (UPSTREAM_TRAILER, plan.sl.upstream))
+    lines += ["%s: %s" % (PATH_TRAILER, path) for path in plan.sl.paths]
     return "\n".join(lines) + "\n"
-
-
-def commit_identity(repo: Repo, source: str, parents: list[str]) -> dict[str, str]:
-    """Take identities from the source so that identical inputs produce identical commits."""
-    an, ae, ad, cn, ce, cd = repo.run("log", "-1", "--date=raw", "--format=%an%x1f%ae%x1f%ad%x1f%cn%x1f%ce%x1f%cd",
-                                      source).strip().split("\x1f")
-    dates = [cd] + [repo.run("log", "-1", "--date=raw", "--format=%cd", p).strip() for p in parents]
-    return {"GIT_AUTHOR_NAME": an, "GIT_AUTHOR_EMAIL": ae, "GIT_AUTHOR_DATE": ad,
-            "GIT_COMMITTER_NAME": cn, "GIT_COMMITTER_EMAIL": ce,
-            "GIT_COMMITTER_DATE": max(dates, key=lambda date: int(date.split()[0]))}
 
 
 def _files(n: int) -> str:
@@ -682,7 +816,32 @@ def changed_paths(repo: Repo, plan: Plan) -> list[str]:
     return diff_names(repo, repo.tree(reference), plan.result, plan.sl.paths)
 
 
-def apply(repo: Repo, plan: Plan, quiet: bool = False) -> str | None:
+def plan_notes(plan: Plan) -> list[str]:
+    notes = []
+    if plan.export_only:
+        notes.append("%s has changes that %s lacks in:\n  %s\nmake them in %s as well so that both pull requests "
+                     "agree" % (plan.branch, plan.frm, "\n  ".join(plan.export_only), plan.frm))
+    if plan.deferred:
+        notes.append("not exported, because the changes build on %s changes that %s lacks:\n  %s"
+                     % (plan.sl.upstream, plan.base, "\n  ".join(plan.deferred)))
+    if plan.base_conflicts:
+        notes.append("%s conflicts with %s in:\n  %s\nmerge %s into %s, then update"
+                     % (plan.branch, plan.base, "\n  ".join(plan.base_conflicts), plan.base, plan.frm))
+    return notes
+
+
+def move_branch(repo: Repo, plan: Plan, new: str) -> None:
+    local = plan.export.local
+    if new == local:
+        return
+    at = repo.branch_checked_out_at(plan.branch)
+    if at:
+        raise SliceError("branch %s is checked out or in use at %s; finish the Git operation or switch branches"
+                         % (plan.branch, at))
+    repo.run("update-ref", "-m", "git pathslice", "refs/heads/" + plan.branch, new, local or "0" * len(new))
+
+
+def apply(repo: Repo, plan: Plan, quiet: bool = False, rebuild: bool = False) -> str | None:
     """Write the planned commit to the export branch; return the branch tip, or None if nothing is exported."""
     ex = plan.export
     if plan.conflicts:
@@ -697,6 +856,14 @@ def apply(repo: Repo, plan: Plan, quiet: bool = False) -> str | None:
         sys.stderr.write("note: %s\n" % note)
     changed = changed_paths(repo, plan)
     if plan.fresh and not changed:
+        for note in plan_notes(plan):
+            print("note: " + note)
+        if rebuild and ex.tip and ex.tip != plan.base_tip:
+            move_branch(repo, plan, plan.base_tip)
+            record_branch(repo, plan.branch, plan.sl.name, plan.frm)
+            if not quiet:
+                print("%s: started again at %s with nothing to export" % (plan.branch, plan.base))
+            return plan.base_tip
         if not quiet:
             print("nothing to export: %s has no changes to %s that %s lacks"
                   % (plan.frm, " ".join(plan.sl.paths), plan.base))
@@ -705,12 +872,7 @@ def apply(repo: Repo, plan: Plan, quiet: bool = False) -> str | None:
         "commit-tree", plan.result, *[arg for p in plan.parents for arg in ("-p", p)],
         input=commit_message(repo, plan), env_extra=commit_identity(repo, plan.source, plan.parents)).strip()
     assert new is not None
-    if new != ex.local:
-        at = repo.branch_checked_out_at(plan.branch)
-        if at:
-            raise SliceError("branch %s is checked out or in use at %s; finish the Git operation or switch branches"
-                             % (plan.branch, at))
-        repo.run("update-ref", "-m", "git pathslice", "refs/heads/" + plan.branch, new, ex.local or "0" * len(new))
+    move_branch(repo, plan, new)
     record_branch(repo, plan.branch, plan.sl.name, plan.frm)
     if not quiet:
         if not changed:
@@ -721,18 +883,38 @@ def apply(repo: Repo, plan: Plan, quiet: bool = False) -> str | None:
         else:
             follows = " and follows %s" % plan.base if len(plan.parents) > 1 else ""
             print("%s: %s updated%s" % (plan.branch, _files(len(changed)), follows))
-        if plan.export_only:
-            print("note: %s has changes that %s lacks in:\n  %s\n"
-                  "make them in %s as well so that both pull requests agree"
-                  % (plan.branch, plan.frm, "\n  ".join(plan.export_only), plan.frm))
+    for note in plan_notes(plan):
+        print("note: " + note)
     return new
+
+
+def upstream_hint(repo: Repo, plan: Plan) -> str | None:
+    sl = plan.sl
+    if sl.upstream:
+        return None
+    chain = repo.run("rev-list", "--first-parent", "--parents", plan.source, "^" + plan.merged[-1][1]).splitlines()
+    if not chain:
+        return None
+    advice = ("if it is developed against another branch, set that branch as the upstream: "
+              "git config pathslice.%s.upstream BRANCH" % sl.name)
+    own = _branch_part(repo, _local_branch_ref(repo, plan.frm))
+    refs = repo.run("for-each-ref", "--format=%(refname)", "--contains", chain[-1].split()[0],
+                    "--no-contains", plan.source, "refs/heads", "refs/remotes").splitlines()
+    others = [ref.split("/", 2)[2] for ref in refs if not ref.endswith("/HEAD") and _branch_part(repo, ref) != own]
+    # Integration branches such as dev usually have the shortest names.
+    others.sort(key=lambda name: (len(name.rsplit("/", 1)[-1]), name))
+    if others:
+        return "%s shares commits with %s; %s" % (plan.frm, ", ".join(others[:3]) + (", ..." if len(others) > 3
+                                                                                      else ""), advice)
+    if any(not repo.is_ancestor(parent, plan.base_tip) for line in chain for parent in line.split()[2:]):
+        return "%s merges commits that are not on %s; %s" % (plan.frm, plan.base, advice)
+    return None
 
 
 def print_plan(repo: Repo, plan: Plan, verbose: bool = False) -> None:
     ex = plan.export
     print("slice %s: %s -> %s  (branch %s)" % (plan.sl.name, plan.frm, plan.base, plan.branch))
     print("  measured from: %s" % ", ".join("%s at %s" % (ref, short(sha)) for ref, sha in plan.merged))
-    changed: list[str] = []
     if plan.conflicts:
         print("  conflicts with %s in: %s" % (plan.base, ", ".join(plan.conflicts)))
     elif plan.export_conflicts:
@@ -750,33 +932,53 @@ def print_plan(repo: Repo, plan: Plan, verbose: bool = False) -> None:
         else:
             state = "not created; %s to export" % _files(len(changed))
         print("  branch: " + state)
-        if plan.export_only:
-            print("  changes not in %s: %s" % (plan.frm, ", ".join(plan.export_only)))
-    for note in ex.notes + ([plan.hint] if plan.hint else []):
+        for note in plan_notes(plan):
+            print("  note: " + note.replace("\n", "\n  "))
+    hint = upstream_hint(repo, plan)
+    for note in ex.notes + ([hint] if hint else []):
         print("  note: " + note)
     if verbose:
-        commits = source_commits(repo, plan)
+        commits = source_commits(repo, plan, exported_since(plan, landed_only=True))
         print("  source commits:" if commits else "  source commits: none")
         for sha, subject in commits:
             print("    %s %s" % (short(sha), subject))
-        for path in changed:
-            print("  changes %s" % path)
+        if not plan.conflicts and not plan.export_conflicts:
+            files = diff_names(repo, repo.tree(plan.export_base), plan.result, plan.sl.paths)
+            print("  files in the export:" if files else "  files in the export: none")
+            for path in files:
+                print("    %s" % path)
 
 
 # Publication
 
 
+def remote_value(repo: Repo, remote: str, branch: str) -> str | None:
+    ref = "refs/heads/" + branch
+    for line in repo.run("ls-remote", remote, ref).splitlines():
+        sha, _, name = line.partition("\t")
+        if name == ref:
+            return sha
+    return None
+
+
 def push(repo: Repo, plan: Plan, new: str, remote: str, force: bool = False, quiet: bool = False) -> None:
     ref = "refs/heads/" + plan.branch
-    remote_tip = repo.rev("refs/remotes/%s/%s" % (remote, plan.branch))
-    if new == remote_tip:
+    actual = remote_value(repo, remote, plan.branch)
+    if new == actual:
         if not quiet:
             print("%s is already up to date on %s" % (plan.branch, remote))
         return
-    if remote_tip and not force and not repo.is_ancestor(remote_tip, new):
-        raise SliceError("%s/%s has commits that %s lacks; run git pathslice publish to include them"
-                         % (remote, plan.branch, plan.branch))
-    repo.run("push", "--force-with-lease=%s:%s" % (ref, remote_tip or ""), remote, "%s:%s" % (ref, ref))
+    if actual:
+        if repo.rev(actual) is None:
+            raise SliceError("%s on %s has commits that this repository lacks; run git pathslice publish to "
+                             "include them" % (plan.branch, remote))
+        # A forced push replaces only commits that were fetched and built on, or that the base already holds.
+        tip = plan.export.tip
+        seen = actual == plan.export.remote_tip or (tip is not None and repo.is_ancestor(actual, tip))
+        if not (repo.is_ancestor(actual, new) or (force and seen) or export_landed(repo, actual, plan.base_tip)):
+            raise SliceError("%s on %s has commits that %s lacks; run git pathslice publish to include them"
+                             % (plan.branch, remote, plan.branch))
+    repo.run("push", "--force-with-lease=%s:%s" % (ref, actual or ""), remote, "%s:%s" % (new, ref))
     if not quiet:
         print("pushed %s to %s" % (plan.branch, remote))
 
@@ -798,7 +1000,9 @@ def resolve_from(repo: Repo, frm: str | None) -> str:
     cur = repo.current_branch()
     if not cur:
         raise SliceError("HEAD is detached; specify the source branch with --from")
-    return branch_mappings(repo).get(cur, {}).get("pathslicesource") or cur
+    recorded = branch_mappings(repo).get(cur, {}).get("pathslicesource")
+    legacy = [r["source_ref"] for r in legacy_records(repo) if r["branch"] == cur] if not recorded else []
+    return recorded or (legacy[0] if legacy else cur)
 
 
 def _source(repo: Repo, frm: str) -> str:
@@ -829,7 +1033,7 @@ def cmd_add(repo: Repo, a: argparse.Namespace) -> None:
     sl = get_slice(repo, a.name)
     print("slice %s: %s onto %s%s (%s)" % (a.name, " ".join(sl.paths), sl.base,
                                           ", upstream " + sl.upstream if sl.upstream else "", where))
-    if a.shared and repo.run("status", "--porcelain", "--", SHARED_FILE).strip():
+    if a.shared and repo.run("status", "--porcelain", "--untracked-files=all", "--", SHARED_FILE).strip():
         print("note: %s is not committed yet; commit it so the definition travels with the repository"
               % SHARED_FILE)
 
@@ -865,16 +1069,17 @@ def cmd_log(repo: Repo, a: argparse.Namespace) -> None:
 
 
 def cmd_status(repo: Repo, a: argparse.Namespace) -> None:
+    if a.branch and not a.name:
+        raise SliceError("--branch needs a slice name")
     frm = resolve_from(repo, a.frm)
     source = _source(repo, frm)
-    names = [a.name] if a.name else list(load_slices(repo, source))
+    names = [get_slice(repo, a.name, source).name] if a.name else list(load_slices(repo, source))
     if not names:
         print("no slices defined")
         return
     for name in names:
         try:
-            plan = make_plan(repo, get_slice(repo, name, source), frm, a.onto, a.branch if a.name else None,
-                             _default_remote(repo))
+            plan = make_plan(repo, get_slice(repo, name, source), frm, a.onto, a.branch, _default_remote(repo))
         except SliceError as e:
             print("slice %s: %s" % (name, e))
             continue
@@ -885,9 +1090,9 @@ def cmd_update(repo: Repo, a: argparse.Namespace) -> int:
     frm = resolve_from(repo, a.frm)
     plan = make_plan(repo, get_slice(repo, a.name, _source(repo, frm)), frm, a.onto, a.branch,
                      a.push or _default_remote(repo), rebuild=a.rebuild)
-    new = apply(repo, plan, a.quiet)
+    new = apply(repo, plan, a.quiet, a.rebuild)
     if a.push and new:
-        push(repo, plan, new, a.push, force=a.rebuild or plan.landed, quiet=a.quiet)
+        push(repo, plan, new, a.push, force=a.rebuild, quiet=a.quiet)
     return 0
 
 
@@ -907,30 +1112,31 @@ def cmd_publish(repo: Repo, a: argparse.Namespace) -> int:
         print("  export branch: %s" % plan.branch)
         print("  PR base: %s" % base)
     if a.no_update:
-        new = plan.export.tip
+        for note in plan.export.notes:
+            sys.stderr.write("note: %s\n" % note)
+        new = plan.export.local or plan.export.tip
         if new is None:
             raise SliceError("branch %s does not exist" % plan.branch)
-        if new != plan.export.local:
-            if repo.branch_checked_out_at(plan.branch):
-                raise SliceError("branch %s is checked out; switch branches first" % plan.branch)
-            repo.run("update-ref", "refs/heads/" + plan.branch, new, plan.export.local or "0" * len(new))
+        move_branch(repo, plan, new)
     else:
-        new = apply(repo, plan, a.quiet)
+        new = apply(repo, plan, a.quiet, a.rebuild)
     if new is None:
         return 0
-    rc, _, err = repo.try_run("diff", "--quiet", repo.merge_base(plan.base_tip, new) or plan.base_tip, new)
-    if rc == 0:
-        print("no changes to publish")
+    if repo.tree(repo.merge_base(plan.base_tip, new) or plan.base_tip) == repo.tree(new):
+        if remote_value(repo, a.remote, plan.branch) in (None, new):
+            print("no changes to publish")
+        else:
+            push(repo, plan, new, a.remote, force=a.rebuild, quiet=a.quiet)
+            print("no changes remain in %s; its pull request now shows none" % plan.branch)
         return 0
-    if rc != 1:
-        raise SliceError(err.strip())
-    push(repo, plan, new, a.remote, force=a.rebuild or plan.landed, quiet=a.quiet)
+    push(repo, plan, new, a.remote, force=a.rebuild, quiet=a.quiet)
     url = github(repo, "pr", "list", "--head", plan.branch, "--base", base, "--state", "open",
                  "--json", "url", "--jq", ".[0].url")
     if url:
         print("using existing PR: %s" % url)
         return 0
-    commits = "\n".join("- %s (%s)" % (subject, short(sha)) for sha, subject in source_commits(repo, plan))
+    commits = "\n".join("- %s (%s)" % (subject, short(sha))
+                        for sha, subject in source_commits(repo, plan, exported_since(plan, landed_only=True)))
     body = "Slice `%s` (%s) from `%s`.\n\n%s" % (sl.name, " ".join(sl.paths), frm, commits)
     cmd = ["pr", "create", "--base", base, "--head", plan.branch,
            "--title", a.title or "%s: %s" % (sl.name, frm), "--body", body]
@@ -948,13 +1154,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version="git-pathslice " + VERSION)
     sub = p.add_subparsers(dest="cmd", metavar="<command>")
 
-    def common(sp: argparse.ArgumentParser, branch: bool = True, quiet: bool = False) -> None:
+    def common(sp: argparse.ArgumentParser, quiet: bool = False) -> None:
         sp.add_argument("--from", dest="frm", metavar="BRANCH",
                         help="source of committed changes (default: the current branch or its recorded source)")
         sp.add_argument("--onto", metavar="BASE", help="base branch (default: the slice's configured base)")
-        if branch:
-            sp.add_argument("--branch", metavar="NAME",
-                            help="export branch (default: the recorded branch or pathslice/<name>/<from>)")
+        sp.add_argument("--branch", metavar="NAME",
+                        help="export branch (default: the recorded branch or pathslice/<name>/<from>)")
         if quiet:
             sp.add_argument("-q", "--quiet", action="store_true", help="suppress progress summaries")
 
@@ -976,7 +1181,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("list", help="list slices")
     sp.set_defaults(func=cmd_list)
 
-    sp = sub.add_parser("log", help="show the source commits and files an export contains")
+    sp = sub.add_parser("log", help="show the source commits and the files the export contains")
     sp.add_argument("name")
     common(sp)
     sp.set_defaults(func=cmd_log)
@@ -1017,6 +1222,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        # File names that are not valid UTF-8 are printed as their original bytes.
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(errors="surrogateescape")
     parser = build_parser()
     a = parser.parse_args(argv)
     if not a.cmd:
