@@ -1,19 +1,16 @@
 # git pathslice
 
-Export selected paths from a source branch as a separate pull request. Each
-exported commit retains the original message and metadata for its author and
-committer. Commit trailers (fields appended to the message) identify its
-source. The source branch and checkout remain unchanged.
+Publish the changes a branch makes to selected paths as a separate pull request
+(PR). The source branch and checkout remain unchanged.
 
-Git generates patches, checks whether equivalent changes are already present
-and applies patches using three-way merges where supported. Python manages
-configuration, export records and temporary worktrees. The GitHub CLI (`gh`)
-manages pull requests.
+Git computes each export with `git merge-tree`, without a worktree. Python
+manages configuration and the export branch. The GitHub CLI (`gh`) manages
+pull requests.
 
 ## Installation
 
-Requires Git 2.22 or later and Python 3.12 or later. Pull request (PR) commands
-also require the GitHub CLI, authenticated with `gh auth login`.
+Requires Git 2.40 or later and Python 3.12 or later. PR commands also require
+the GitHub CLI, authenticated with `gh auth login`.
 
 ```sh
 git clone https://github.com/IsaacSST/git-pathslice.git
@@ -33,202 +30,147 @@ A slice is a named selection of paths to export. Define a slice and commit its
 shared configuration:
 
 ```sh
-git pathslice add docs docs/ --base origin/main --shared
+git pathslice add docs docs/ --base origin/main --upstream origin/dev --shared
 git add .gitpathslices
 git commit -m "Define the documentation slice"
 ```
 
-`add` stores the definition. `update` and `publish` create the slice branch.
+| Setting | Meaning |
+| --- | --- |
+| `path` | Paths to export, in Git pathspec syntax, relative to the repository root. `add` also accepts paths relative to the current directory. |
+| `base` | The branch PRs target. |
+| `upstream` | The branch the source is developed against, if it is not the base. Its changes are not exported. |
 
 `.gitpathslices` uses Git configuration syntax and permits multiple `path`
-entries. Local definitions in `.git/config` can add paths or override other
-settings. Paths use Git pathspec syntax, which supports file names, directories
-and patterns, and are relative to the repository root. `add` also accepts paths
-relative to the current directory.
+entries. It is read from the source branch's latest commit, or from the
+working tree if that commit lacks it. Local definitions in `.git/config` can
+add paths or override other settings.
 
 ## Use
 
-Publish the configured documentation slice from your implementation branch:
+Publish the documentation slice from the current branch:
 
 ```sh
 git pathslice publish docs
 ```
 
-`docs` names the slice defined above: it selects `docs/` and targets
-`origin/main`. `publish` fetches the remote, prepares a separate slice branch,
-pushes it, then creates a PR or reuses an open one. `pr` is an alias for
-`publish`.
+`publish` fetches the remote, adds the source's latest changes to the export
+branch, pushes it, then creates a PR or reuses an open one. `pr` is an alias
+for `publish`. Only committed changes are exported.
 
-Each combination of slice and source branch initially uses the branch name
-`pathslice/<slice>/<source>`. For a source branch named `feature`, the PR
-proposes merging `pathslice/docs/feature` into `main`. Later runs update that
-slice branch; the implementation branch remains unchanged. Only committed
-changes are eligible; uncommitted edits are excluded.
-
-A source commit changing `src/parser.rs` and `docs/parser.md` contributes only the
-documentation change. Restricting the patch to the selected paths and adding
-source information to the message gives the exported commit a different hash.
-Files outside the selected paths retain their destination versions. Merge the
-PR through the usual review process. Later exports omit recognised changes
-already incorporated into the destination.
-
-While the PR is open, edit the source branch and rerun `publish` to update it.
-It exits without publishing if there are no changes. For separate steps:
+The export branch is named `pathslice/<slice>/<source>` unless `--branch NAME`
+chooses another. The chosen name is recorded in `branch.<name>.pathsliceSlice`
+and `branch.<name>.pathsliceSource`, which `git branch -m` carries with a
+rename, so later commands find the branch without `--branch`.
 
 | Command | Behaviour |
 | --- | --- |
-| `log docs` | Preview which commits contribute changes, using local Git references. |
-| `update docs` | Prepare the slice branch locally, without fetching. |
-| `update docs --push` | Prepare and push the slice branch, without fetching or opening a PR. |
+| `log docs` | List the source commits and files the export contains. |
+| `status` | Summarise each slice: whether the export branch is up to date, changes made on it that the source lacks, and conflicts. |
+| `update docs` | Update the export branch locally, without fetching. |
+| `update docs --push` | Update and push the export branch, without fetching or opening a PR. |
 
-Use `--from BRANCH` to select another source or `--onto REF` to override the
-destination, for example `--from feature --onto origin/main`.
-`publish --no-update docs` uses the existing slice branch without exporting
-new source changes. It still fetches, pushes and creates or reuses a PR.
+Use `--from BRANCH` to select another source and `--onto REF` to override the
+base. `publish --no-update` publishes the export branch as it is.
 
-Unchanged exports retain their commit hashes. Changes to the destination alone
-do not rebuild the branch for an open PR. Use `--force-rebuild` to rebuild it
-against the destination, rewriting the exported commits. Conflicts with the
-destination are reported when the installed Git version supports this check.
-Repeating an export with identical inputs produces the same commit hashes.
+## What the export contains
 
-Slice branches are recorded locally. An existing branch can be updated only if
-it is recorded for the same slice and source and has not subsequently been
-changed outside pathslice. Neither the source nor the destination branch can be
-used as the slice branch. These checks also apply to `--force-rebuild` and
-`publish --no-update`. If the proposed name is already in use by an ordinary
-branch, rename that branch or use `update --branch NAME` to choose a different
-name for the slice branch. An ordinary branch created from a slice branch
-remains independent.
+The export holds the source's net change to the selected paths. The change is
+measured from the commits the source last merged from its base and from its
+upstream: for each branch, the most recent commit on its first-parent history
+that the source contains. Where merging those two commits conflicts in a file,
+the upstream's version is used. The change is then applied to the base with a
+three-way merge.
+
+A source commit changing `src/parser.rs` and `docs/parser.md` therefore
+contributes only the documentation change. Conflict resolutions in the
+source's merges are part of the net change and are exported. Changes the
+source merged from its upstream or base are not. A change the base already
+contains produces no difference, whichever route it took, so no records of
+merged changes are kept.
+
+Without an upstream, changes the source merged from another branch are
+exported as its own. `status` reports when the source shares commits with
+other branches or merges commits that are not on the base.
+
+The upstream is expected to receive the source through a merge commit, a squash
+merge or a rebase merge, as GitHub performs them. If the upstream is
+fast-forwarded to the source, the source's changes are measured as already
+merged and the export appears empty.
+
+## Updating an open pull request
+
+While the PR is open, commit to the source branch and run `publish` again.
+Each update adds one commit to the export branch. Earlier commits are not
+rewritten, so pushes are fast-forwards. The commit lists the source commits it
+covers, and the trailers `Pathslice-Slice` and `Pathslice-Source` identify the
+slice and the source commit. Identities and dates are taken from the source
+commit and the parents, so identical inputs produce identical commits.
+
+Commits added to the export branch, such as review suggestions applied on
+GitHub, are kept. `update` and `status` list the files in which the export
+branch differs from the source; make those changes in the source as well so
+that both PRs agree. If such a change conflicts with a later source change,
+the update stops. Make the change in the source, or run with `--rebuild` to
+discard it.
+
+Changes to the base alone leave the export branch unchanged. If the source
+merges a newer base than the export branch holds, the next update commit also
+merges the base, so the PR still shows only the source's changes.
+
+After the PR is merged, by merge commit or squash, `update` reports that there
+is nothing to export. When the source has new changes, the next update starts
+again from the base.
+
+`--rebuild` starts the export branch again from the base, discarding its
+commits. The push uses a lease, as described below.
+
+## Conflicts
+
+If the source's changes conflict with the base, `update` and `publish` stop and
+name the files. Merge the base into the source, resolve the conflicts there,
+then run the command again. The resolution then belongs to the source and
+reaches the export with the rest of its changes.
 
 ## Working with Git
 
-Pathslice installs no hooks. Ordinary Git commands remain available; pathslice
-checks before changing branches and reports altered or missing exports in
-`status`. It refuses to update branches checked out or used by a rebase or
-bisect, including in other worktrees. Changes made directly on a slice branch
-are preserved. Transfer any changes you wish to retain to the source branch
-before rebuilding the export.
+Pathslice installs no hooks. It refuses to update a branch that is checked out
+or used by a rebase or bisect, including in other worktrees. Neither the source
+nor the base can be the export branch. An existing branch is updated only if it
+holds a pathslice commit for the slice, holds commits made by version 0.2, or
+is recorded for the slice and source.
 
-After cloning the repository or renaming a slice branch with `git branch -m`,
-register the local branch with pathslice:
+`publish` fetches first. If the local export branch and the remote branch have
+diverged, local commits made by pathslice are replaced by the remote history,
+since they are recomputed; any other local commit stops the command. `update`
+does not fetch, builds on the local branch and reports a divergence. Pushes use
+Git's `--force-with-lease` option with the last fetched value, so a remote
+branch that changed since the last fetch is not overwritten.
 
-```sh
-git pathslice adopt docs --from feature --branch review/docs
-```
+## Upgrading from version 0.2
 
-`adopt` records the branch as managed by pathslice without changing its
-commits. It requires a matching local export record or verifies content and
-commit metadata against the source patches. It refuses branches with
-independent edits or conflict resolutions that it cannot verify. If the source
-was renamed, supply its new name with `--from`. Renaming locally does not
-rename a remote branch or an existing PR.
+An export branch made by version 0.2 continues: its first update adds one
+commit that brings it into line with the source's net change. The branch that
+version 0.2 recorded for a slice and source is found without `--branch`.
 
-The recorded branch is used by later commands. `update`, `publish`, `log` and
-`status` accept `--branch` to choose another; multiple exports for the same
-slice and source require an explicit choice. Running from a managed slice
-branch uses its recorded source. If Git deletes a recorded export, recreate it
-explicitly with `update --branch NAME`.
-
-To continue working on an export as an ordinary branch:
+The commands `continue`, `skip`, `abort`, `adopt`, `release`, `landed` and
+`forget` have been removed, and the `select` and `subject` settings are
+ignored. Records under `refs/pathslices/` are no longer written. After the first
+update of each export branch, remove them with:
 
 ```sh
-git pathslice release docs --from feature --branch review/docs
+git for-each-ref --format='delete %(refname)' refs/pathslices/ | git update-ref --stdin
 ```
 
-`release` stops pathslice from managing the branch. It retains the branch and
-the records of changes already incorporated into the destination.
-
-## Selection
-
-Set the rule with `add --select RULE`:
-
-| Rule | Commits exported |
-| --- | --- |
-| `all` | Any commit affecting the paths, restricted to those paths. |
-| `pure` | Commits affecting only those paths. |
-| `marked` | Commits with `Slice: NAME` or a subject matching `--subject REGEX`. |
-
-`--all` overrides the rule. Excluded or manually skipped commits remain
-eligible for later exports, including after an earlier export has been merged.
-
-## Recognising previously incorporated changes
-
-`Sliced-From: SHA` identifies the source commit. The `Pathslice:` trailer
-identifies the slice name, selected paths and destination reference. Together,
-these define the scope of an export. Evidence that changes have already been
-incorporated into the destination applies only within that scope. Local records
-under `refs/pathslices/` and the slice branch are updated in a single Git
-transaction.
-
-Normal merges are recognised through commit ancestry. Independently applied
-commits are recognised by comparing patches restricted to the selected paths.
-Squash merges can be recognised when a later destination revision matches every
-file changed by the export. Recognising a squash merge marks only the recorded
-exported commits as incorporated into the destination.
-
-For existing history or a squash merge that cannot be recognised:
-
-```sh
-git pathslice landed docs SOURCE_REVISION
-```
-
-This records a checkpoint: the selected changes in that revision and its
-ancestors are treated as already accounted for and excluded from later exports.
-Verify the revision first. Checkpoints accumulate across branches; use `forget`
-to clear mistaken checkpoints before replacing them. Changing the paths or
-destination starts a separate scope.
-
-An ordinary clone does not copy export records or the records used to detect
-unexpected remote changes when pushing. A checkpoint may be needed for squash
-merges if neither export records nor commit trailers identifying the scope are
-available, or if the exported files contain additional edits. `Sliced-From:`
-trailers alone do not establish that changes were incorporated into the
-destination.
-
-## Conflicts and publication
-
-Resolve and stage conflicts in the reported worktree under `.git/pathslice/`,
-then run from the source checkout:
-
-```sh
-git pathslice continue docs  # resume the update
-git pathslice skip docs      # omit the conflicting commit
-git pathslice abort docs     # discard the update
-```
-
-`continue` preserves commit metadata. `abort` retains the previous slice
-branch. If `publish` stopped on a conflict, rerun it after `continue` to
-publish.
-
-When a previous publication record exists, pathslice checks that the remote
-branch matches the last accepted export before pushing. It uses Git's
-`--force-with-lease` option to prevent the push from overwriting changes made
-after this check. Unexpected remote changes cause the push to be refused, even
-after a background fetch. A new checkout validates the remote export's scope
-and source history before replacing it. It also verifies content and commit
-metadata: source information in commit trailers alone does not establish that a
-commit is unchanged. Unrecognised or altered remote exports are refused. Failed
-pushes leave the local export available for retry.
-
-## Other commands
-
-`list` and `status` inspect slices; `rm` removes definitions. `forget` removes
-records of previously incorporated changes and checkpoints. It retains the
-record of which branches pathslice manages and the records used to check remote
-branches before pushing. `forget --branch` also deletes the recorded slice
-branch and its management record, provided the branch is unchanged and not in
-use. Use `--export-branch NAME` to choose among multiple exports when deleting.
-Use `git pathslice COMMAND -h` for options.
+A `.git/pathslice/` directory left by an interrupted version 0.2 update can be
+deleted.
 
 ## Limits and tests
 
-Source merge commits are not exported. Changes made only in merge resolutions
-may therefore be omitted without a conflict. Review the final diff. Renames
-crossing a slice boundary become additions or deletions. Path selection does
-not check dependencies between documentation and code.
+Renames crossing a slice boundary become additions or deletions. Path
+selection does not check dependencies between documentation and code.
 
-Development uses Python 3.14. Compatibility checks cover Python 3.12 and 3.14. Tests require Git 2.28 or later.
+Development uses Python 3.14. Compatibility checks cover Python 3.12 and 3.14. Tests require Git 2.40 or later.
 
 ```sh
 python3.14 -m venv .venv
