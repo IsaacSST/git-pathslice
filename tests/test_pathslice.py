@@ -138,7 +138,8 @@ class Base(unittest.TestCase):
                 calls = pathlib.Path(os.environ["GH_TEST_CALLS"])
                 with calls.open("a") as out:
                     out.write(json.dumps(args) + "\\n")
-                if os.environ.get("GH_TEST_FAIL"):
+                if os.environ.get("GH_TEST_FAIL") or (
+                        os.environ.get("GH_TEST_FAIL_CREATE") and args[:2] == ["pr", "create"]):
                     sys.stderr.write("service unavailable")
                     sys.exit(1)
                 created = calls.with_suffix(".created")
@@ -203,6 +204,17 @@ class TestExport(Base):
             self.assertIn(trailer, body)
         self.assertEqual(self.git("symbolic-ref", "--short", "HEAD").strip(), "main")
         self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_identities_with_line_separators(self):
+        self.dev()
+        self.switch("dev")
+        self.write({"docs/later.md": "later\n"})
+        self.git("add", "-A")
+        name = "Ann\u2028Lee\rDev"
+        self.git("commit", "-q", "-m", "docs: later note", env=dict(self.env, GIT_AUTHOR_NAME=name))
+        self.switch("main")
+        self.slice("update", "docs", "--from", "dev")
+        self.assertEqual(self.git("log", "-1", "--format=%an", BRANCH), name + "\n")
 
     def test_repeated_exports_are_stable_and_reproducible(self):
         self.dev()
@@ -345,6 +357,44 @@ class TestMeasurement(Base):
         self.slice("update", "docs", "--from", "feature")
         self.assertEqual(self.proposed(branch), ["docs/feature.md", "docs/more.md"])
 
+    def test_source_taken_by_the_upstream_by_fast_forward(self):
+        self.lineage()
+        branch = "pathslice/docs/feature"
+        self.slice("update", "docs", "--from", "feature")
+        self.switch(branch)
+        self.commit("Apply suggestion from review", {"docs/index.md": "intro, reviewed\n"})
+        self.switch("feature")
+        self.commit("feature: more documentation", {"docs/feature2.md": "more\n"})
+        self.switch("main")
+        self.slice("update", "docs", "--from", "feature")
+        self.git("branch", "-f", "dev", "feature")
+        self.slice("update", "docs", "--from", "feature")
+        # The source's changes now count as the upstream's, so only the change made on the branch remains.
+        self.assertEqual(self.proposed(branch), ["docs/index.md"])
+        body = self.git("log", "-1", "--format=%B", branch)
+        self.assertIn("Pathslice-Base-Commit: %s\n" % self.sha("main"), body)
+        self.assertIn("Pathslice-Upstream-Commit: %s\n" % self.sha("dev"), body)
+
+    def test_missing_recorded_upstream_commit_is_reported(self):
+        self.lineage()
+        branch = "pathslice/docs/feature"
+        self.slice("update", "docs", "--from", "feature")
+        self.switch(branch)
+        self.commit("Apply suggestion from review", {"docs/index.md": "intro, reviewed\n"})
+        self.switch("dev")
+        self.commit("dev: more code", {"src/c.py": "z=1\n"})
+        self.switch("feature")
+        self.commit("feature: more documentation", {"docs/feature2.md": "more\n"})
+        self.switch("main")
+        self.slice("update", "docs", "--from", "feature")
+        recorded = self.sha("dev")
+        self.git("branch", "-f", "dev", "dev~1")
+        self.git("reflog", "expire", "--expire=now", "--all")
+        self.git("prune", "--expire=now")
+        self.assertFalse(self.exists(recorded, ""))
+        out = self.slice("status", "docs", "--from", "feature").stdout
+        self.assertIn("was last exported with dev at %s, which this repository lacks" % recorded[:10], out)
+
     def test_changes_that_build_on_the_upstream_are_left_out(self):
         self.lineage()
         self.switch("feature")
@@ -441,18 +491,25 @@ class TestExportBranch(Base):
         self.assertEqual(self.sha(BRANCH), updated)
         self.later("docs: take the review suggestion", {"docs/index.md": "intro, reviewed\n"})
         out = self.slice("update", "docs", "--from", "dev").stdout
-        self.assertIn("is up to date", out)
+        self.assertIn("already holds the latest changes of dev; a new commit records them", out)
         self.assertNotIn("lacks", out)
+        self.assertEqual(self.git("diff", "--name-only", BRANCH + "^", BRANCH), "")
+        # A later change to the same line builds on the recorded export.
+        self.later("docs: extend the intro", {"docs/index.md": "intro, reviewed and extended\n"})
+        self.slice("update", "docs", "--from", "dev")
+        self.assertEqual(self.show(BRANCH, "docs/index.md"), "intro, reviewed and extended\n")
 
     def test_exports_without_a_recorded_target_are_continued(self):
         self.dev()
         self.slice("update", "docs", "--from", "dev")
-        # Make the export commit again without its Pathslice-Target trailer, as version 0.3.0 wrote it.
+        # Make the export commit again without the trailers that version 0.3.0 did not write.
         info = self.git("log", "-1", "--date=raw", "--format=%an%n%ae%n%ad%n%cn%n%ce%n%cd%n%T%n%P", BRANCH).split("\n")
         message = os.path.join(self.tmp, "message")
         with open(message, "w") as f:
-            f.writelines(line for line in self.git("log", "-1", "--format=%B", BRANCH).splitlines(True)
-                         if not line.startswith("Pathslice-Target:"))
+            f.write("".join(line for line in self.git("log", "-1", "--format=%B", BRANCH).splitlines(True)
+                            if not line.startswith(("Pathslice-Target:", "Pathslice-Base-Commit:",
+                                                    "Pathslice-Upstream-Commit:")))
+                    .rstrip("\n") + "\n")
         env = dict(self.env, GIT_AUTHOR_NAME=info[0], GIT_AUTHOR_EMAIL=info[1], GIT_AUTHOR_DATE="@" + info[2],
                    GIT_COMMITTER_NAME=info[3], GIT_COMMITTER_EMAIL=info[4], GIT_COMMITTER_DATE="@" + info[5])
         self.git("update-ref", "refs/heads/" + BRANCH,
@@ -466,11 +523,38 @@ class TestExportBranch(Base):
         self.assertEqual(self.show(BRANCH, "docs/index.md"), "intro, reviewed\n")
         self.assertTrue(self.exists(BRANCH, "docs/later.md"))
         self.assertIn("Pathslice-Target: ", self.git("log", "-1", "--format=%B", BRANCH))
-        # The recorded tree is not part of the branch's history; without it, the update computes it again.
+        # The recorded tree is not part of the branch's history, so no result may depend on its presence.
+        before = self.slice("status", "docs", "--from", "dev").stdout
         self.git("prune", "--expire=now")
+        self.assertEqual(self.slice("status", "docs", "--from", "dev").stdout, before)
         updated = self.sha(BRANCH)
         self.assertIn("is up to date", self.slice("update", "docs", "--from", "dev").stdout)
         self.assertEqual(self.sha(BRANCH), updated)
+
+    def test_changes_withdrawn_after_an_export_landed_stay_withdrawn(self):
+        self.dev()
+        self.slice("update", "docs", "--from", "dev")
+        self.git("merge", "-q", "--squash", BRANCH)
+        self.git("commit", "-q", "-m", "Add the documentation (#1)")
+        self.later("docs: withdraw the feature page", {"docs/feature.md": None})
+        self.slice("update", "docs", "--from", "dev")
+        self.assertFalse(self.exists(BRANCH, "docs/feature.md"))
+        self.later()
+        self.slice("update", "docs", "--from", "dev")
+        self.assertFalse(self.exists(BRANCH, "docs/feature.md"))
+        self.assertTrue(self.exists(BRANCH, "docs/later.md"))
+
+    def test_branch_follows_the_base_to_take_the_source_resolution(self):
+        self.dev()
+        self.slice("update", "docs", "--from", "dev")
+        self.commit("docs: reword the intro", {"docs/index.md": "intro, reworded\n"})
+        self.switch("dev")
+        self.merge("main", resolve={"docs/index.md": "intro, clarified\n"})
+        self.switch("main")
+        self.assertIn("a merge of main to add", self.slice("status", "docs", "--from", "dev").stdout)
+        self.assertIn("follows main", self.slice("update", "docs", "--from", "dev").stdout)
+        self.assertEqual(self.sha(BRANCH + "^2"), self.sha("main"))
+        self.git("merge-tree", "--write-tree", "main", BRANCH)
 
     def test_conflicting_review_commit_is_refused_until_rebuilt(self):
         self.dev()
@@ -849,7 +933,7 @@ class TestPublication(Base):
             f.write("#!/bin/sh\necho 'Open a pull request at https://example.invalid/new'\n")
         os.chmod(hook, 0o755)
         p = self.slice("publish", "docs", "--from", "dev", env=self.without_gh())
-        self.assertIn("remote: Open a pull request at https://example.invalid/new", p.stdout)
+        self.assertIn("remote: Open a pull request at https://example.invalid/new\n", p.stdout)
         self.assertIn("no pull request was opened from %s into main: gh, the GitHub CLI, is not installed"
                       % BRANCH, p.stderr)
         self.assertEqual(self.git("rev-parse", BRANCH, cwd=bare).strip(), self.sha(BRANCH))
@@ -859,6 +943,14 @@ class TestPublication(Base):
         p = self.slice("publish", "docs", "--from", "dev")
         self.assertIn("no pull request was opened from %s into main: gh failed: service unavailable" % BRANCH,
                       p.stderr)
+        self.assertEqual(self.git("rev-parse", BRANCH, cwd=bare).strip(), self.sha(BRANCH))
+        # gh can list the pull requests but not create one: an error, after the push.
+        del self.env["GH_TEST_FAIL"]
+        self.env["GH_TEST_FAIL_CREATE"] = "1"
+        self.later("docs: another note", {"docs/another.md": "another\n"})
+        p = self.slice("publish", "docs", "--from", "dev", check=False)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("gh failed: service unavailable", p.stderr)
         self.assertEqual(self.git("rev-parse", BRANCH, cwd=bare).strip(), self.sha(BRANCH))
 
     def test_pull_request_after_a_merge_lists_only_new_commits(self):
@@ -890,6 +982,13 @@ class TestInspection(Base):
         self.assertIn("docs: clarify intro", out)
         self.assertNotIn("code only", out)
         self.assertIn("files in the export:\n    docs/feature.md\n    docs/index.md\n    docs/old.md", out)
+
+    def test_errors_are_reported_with_standard_output_closed(self):
+        p = subprocess.run([sys.executable, SLICE, "status", "--branch", "x"], cwd=self.repo, env=self.env,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                           preexec_fn=lambda: os.close(1))
+        self.assertEqual(p.returncode, 1)
+        self.assertEqual(p.stderr, "fatal: --branch needs a slice name\n")
 
     def test_status_arguments_are_checked(self):
         self.dev()

@@ -20,10 +20,10 @@ A feature branch made from `dev` changes both. Its documentation slice has the
 base `main` and the upstream `dev`, so the export branch proposes to `main` only
 the feature's own documentation changes.
 
-Git computes each export with `git merge-tree`, without a worktree. Python
-manages configuration and the export branch. Pathslice works with any Git
-repository and remote; on GitHub, it opens pull requests with the GitHub CLI
-(`gh`) if that is installed.
+Git computes each export with `git merge-tree`, without using the work tree.
+Python manages configuration and the export branch. Pathslice runs in any Git
+repository that has a work tree and pushes to any remote; on GitHub, it opens
+pull requests with the GitHub CLI (`gh`) if that is installed.
 
 ## Installation
 
@@ -83,10 +83,12 @@ git pathslice publish docs
 export branch, pushes it, then creates a PR or reuses an open one. `pr` is an
 alias for `publish`. Only committed changes are exported.
 
-If the GitHub CLI is not installed, or cannot open the PR, for example because
-the remote is not on GitHub, `publish` ends after the push with exit status 0.
-It prints the messages the server returned, such as a link for opening a pull
-request, and notes why no PR was opened.
+If the GitHub CLI is not installed, or cannot list the repository's pull
+requests, for example because the remote is not on GitHub or `gh` is not logged
+in, `publish` ends after the push with exit status 0. It prints the messages the
+server returned, such as a link for opening a pull request, and notes why no PR
+was opened. If `gh` lists the pull requests but cannot create one, `publish`
+reports the error and exits with status 1.
 
 The export branch is named `pathslice/<slice>/<source branch>` unless
 `--branch NAME` chooses another. The slice, source branch and base are
@@ -139,9 +141,14 @@ Each update adds one commit to the export branch; earlier commits are not
 rewritten, so pushes are fast-forwards. The commit lists the source commits it
 covers. Its trailers record the slice (`Pathslice-Slice`), the source commit
 (`Pathslice-Source`), the definition used (`Pathslice-Base`,
-`Pathslice-Upstream` and `Pathslice-Path`) and the tree computed for the export
-(`Pathslice-Target`), which the next update compares with the export branch to
-find changes made on it. Identities and dates are taken from the source commit
+`Pathslice-Upstream` and `Pathslice-Path`), and the base and upstream commits
+the export was computed from (`Pathslice-Base-Commit` and
+`Pathslice-Upstream-Commit`), from which the next update computes the export
+again. `Pathslice-Target` records the tree computed for the export, except in the
+first export after an earlier export has landed, whose computation counts the
+landed changes as merged and cannot be repeated. If that tree is the commit's
+own, because the update kept no changes made on the export branch, the next
+update uses it instead. Identities and dates are taken from the source commit
 and the parents, so identical inputs produce identical commits.
 
 A change to the slice's paths or upstream takes effect at the next update,
@@ -158,14 +165,17 @@ again.
 Commits added to the export branch, such as review suggestions applied on
 GitHub, are kept. `update` and `status` list the files in which the export
 branch differs from the source branch; make those changes in the source branch
-as well, so that the two agree. If such a change conflicts with a later change
-to the source branch, the update stops. Make the change in the source branch,
-or run with `--rebuild` to discard it.
+as well, so that the two agree. The next update then adds a commit without file
+changes that records the source branch's new state. If such a change conflicts
+with a later change to the source branch, the update stops. Make the change in
+the source branch, or run with `--rebuild` to discard it.
 
 Changes to the base alone leave the export branch unchanged; `update` and
 `status` report when it no longer merges cleanly into the base. If the source
 branch merges a newer base than the export branch holds, the next update commit
 also merges the base, so the PR still shows only the source branch's changes.
+If the slice is unchanged, the update adds that merge only when the export
+branch would otherwise conflict with the base.
 
 If the source branch withdraws all its changes while the PR is open, the next
 update leaves the export branch with none, and `publish` pushes it so that the
