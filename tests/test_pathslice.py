@@ -579,6 +579,18 @@ class TestBranchSafety(Base):
         self.assertEqual(p.returncode, 1)
         self.assertIn("exports slice docs onto main", p.stderr)
 
+    def test_branches_for_different_bases_are_told_apart(self):
+        self.dev()
+        self.slice("update", "docs", "--from", "dev")
+        self.git("branch", "release", "main~1")
+        self.slice("update", "docs", "--from", "dev", "--onto", "release", "--branch", "docs-for-release")
+        self.later()
+        self.assertIn("%s: 1 file updated" % BRANCH, self.slice("update", "docs", "--from", "dev").stdout)
+        out = self.slice("update", "docs", "--from", "dev", "--onto", "release").stdout
+        self.assertIn("docs-for-release: 1 file updated", out)
+        self.assertEqual(self.proposed("docs-for-release", "release"),
+                         ["docs/feature.md", "docs/index.md", "docs/later.md", "docs/old.md"])
+
     def test_custom_branch_is_remembered_and_follows_renames(self):
         self.dev()
         self.slice("update", "docs", "--from", "dev", "--branch", "review/docs")

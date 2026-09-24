@@ -7,8 +7,8 @@ request (PR). The branch you work on stays as it is.
 
 - **Slice**: a named set of paths, such as `docs/`, with the branch its PRs
   target.
-- **Source branch**: the branch you commit to, which may change files inside
-  and outside the slice.
+- **Source branch**: the branch you commit to. Its commits may change files
+  inside and outside the slice.
 - **Base**: the branch the PR targets, such as `main`.
 - **Upstream**: the branch the source branch is developed against, if it is not
   the base, such as `dev`. Its changes are not exported.
@@ -63,10 +63,11 @@ git commit -m "Define the documentation slice"
 magic, such as `:!drafts`, are stored as given and read from the repository
 root, so give those from the root.
 
-`.gitpathslices` uses Git configuration syntax. It is read from the source
-branch's latest commit, or from the working tree if that commit lacks it.
-Definitions in Git's own configuration, such as `.git/config`, can add paths or
-override other settings.
+`.gitpathslices` uses Git configuration syntax. Commands that export read it
+from the source branch's latest commit, or from the working tree if that commit
+lacks it; `list`, `add` and `rm` use the copy in the working tree. Definitions
+in Git's own configuration, such as `.git/config`, can add paths or override
+other settings.
 
 ## Use
 
@@ -81,10 +82,10 @@ export branch, pushes it, then creates a PR or reuses an open one. `pr` is an
 alias for `publish`. Only committed changes are exported.
 
 The export branch is named `pathslice/<slice>/<source branch>` unless
-`--branch NAME` chooses another. The name is recorded in the branch's Git
-configuration (`branch.<name>.pathsliceSlice` and `pathsliceSource`), which
-`git branch -m` carries with a rename, so later commands find the branch
-without `--branch`.
+`--branch NAME` chooses another. The slice, source branch and base are
+recorded in the branch's Git configuration (`branch.<name>.pathsliceSlice`,
+`pathsliceSource` and `pathsliceBase`), which `git branch -m` carries with a
+rename, so later commands find the branch without `--branch`.
 
 | Command | Behaviour |
 | --- | --- |
@@ -137,7 +138,8 @@ commits.
 
 A change to the slice's paths or upstream takes effect at the next update,
 which compares the new export with the one made under the recorded definition.
-An export branch serves one base; choose another `--branch` for another base.
+An export branch serves one base. For another base, choose another `--branch`
+once; later commands pick the branch recorded for the base in use.
 
 An update stops if the source branch is behind the commit that the export
 branch was last made from, as in a checkout that has not pulled. It also stops
@@ -161,9 +163,9 @@ If the source branch withdraws all its changes while the PR is open, the next
 update leaves the export branch with none, and `publish` pushes it so that the
 PR shows none.
 
-After the PR is merged, by merge commit or squash, `update` reports that there
-is nothing to export, and the changes the PR brought to the base count as
-merged even if the base edits them later. When the source branch has new
+After the PR is merged, whether by merge commit, squash or rebase, `update`
+reports that there is nothing to export, and the changes the PR brought to the
+base count as merged even if the base edits them later. When the source branch has new
 changes, the next update starts the export branch again from the base.
 
 `--rebuild` starts the export branch again from the base, discarding its
