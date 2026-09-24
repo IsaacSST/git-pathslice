@@ -154,6 +154,14 @@ class Base(unittest.TestCase):
         with open(calls) as f:
             return [json.loads(line) for line in f]
 
+    def without_gh(self):
+        """The environment with gh removed from PATH."""
+        tools = os.path.join(self.tmp, "without-gh")
+        os.makedirs(tools)
+        os.symlink(shutil.which("git", path=self.env["PATH"]), os.path.join(tools, "git"))
+        dirs = [d for d in self.env["PATH"].split(os.pathsep) if not os.path.exists(os.path.join(d, "gh"))]
+        return dict(self.env, PATH=os.pathsep.join([tools] + dirs))
+
     def dev(self):
         """dev changes documentation and code; main gains an unrelated page."""
         self.switch("dev", create=True)
@@ -829,13 +837,29 @@ class TestPublication(Base):
         self.later()
         self.assertIn("using existing PR", self.slice("pr", "docs", "--from", "dev").stdout)
         self.assertEqual(self.show("review/docs", "docs/later.md", cwd=bare), "later\n")
-        self.env["GH_TEST_FAIL"] = "1"
-        p = self.slice("publish", "docs", "--from", "dev", check=False)
-        self.assertNotEqual(p.returncode, 0)
-        self.assertIn("service unavailable", p.stderr)
         created = [cmd for cmd in self.gh_calls(calls) if cmd[:2] == ["pr", "create"]]
         self.assertEqual(len(created), 1)
         self.assertIn("--draft", created[0])
+
+    def test_publish_pushes_when_no_pull_request_can_be_opened(self):
+        self.dev()
+        bare = self.remote()
+        hook = os.path.join(bare, "hooks", "post-receive")
+        with open(hook, "w") as f:
+            f.write("#!/bin/sh\necho 'Open a pull request at https://example.invalid/new'\n")
+        os.chmod(hook, 0o755)
+        p = self.slice("publish", "docs", "--from", "dev", env=self.without_gh())
+        self.assertIn("remote: Open a pull request at https://example.invalid/new", p.stdout)
+        self.assertIn("no pull request was opened from %s into main: gh, the GitHub CLI, is not installed"
+                      % BRANCH, p.stderr)
+        self.assertEqual(self.git("rev-parse", BRANCH, cwd=bare).strip(), self.sha(BRANCH))
+        self.fake_gh()
+        self.env["GH_TEST_FAIL"] = "1"
+        self.later()
+        p = self.slice("publish", "docs", "--from", "dev")
+        self.assertIn("no pull request was opened from %s into main: gh failed: service unavailable" % BRANCH,
+                      p.stderr)
+        self.assertEqual(self.git("rev-parse", BRANCH, cwd=bare).strip(), self.sha(BRANCH))
 
     def test_pull_request_after_a_merge_lists_only_new_commits(self):
         self.dev()
