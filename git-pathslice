@@ -1062,13 +1062,14 @@ def remote_value(repo: Repo, remote: str, branch: str) -> str | None:
     return None
 
 
-def push(repo: Repo, plan: Plan, new: str, remote: str, force: bool = False, quiet: bool = False) -> None:
+def push(repo: Repo, plan: Plan, new: str, remote: str, force: bool = False, quiet: bool = False) -> list[str]:
+    """Push the export branch; return the messages the server sent, such as a link for opening a pull request."""
     ref = "refs/heads/" + plan.branch
     actual = remote_value(repo, remote, plan.branch)
     if new == actual:
         if not quiet:
             print("%s is already up to date on %s" % (plan.branch, remote))
-        return
+        return []
     if actual:
         if repo.rev(actual) is None:
             raise SliceError("%s on %s has commits that this repository lacks; run git pathslice publish to "
@@ -1079,18 +1080,40 @@ def push(repo: Repo, plan: Plan, new: str, remote: str, force: bool = False, qui
         if not (repo.is_ancestor(actual, new) or (force and seen) or export_landed(repo, actual, plan.base_tip)):
             raise SliceError("%s on %s has commits that %s lacks; run git pathslice publish to include them"
                              % (plan.branch, remote, plan.branch))
-    repo.run("push", "--force-with-lease=%s:%s" % (ref, actual or ""), remote, "%s:%s" % (new, ref))
+    rc, _, err = repo.try_run("push", "--force-with-lease=%s:%s" % (ref, actual or ""), remote, "%s:%s" % (new, ref))
+    if rc != 0:
+        raise SliceError("git push failed:\n" + err.strip())
     repo.forget()
     if not quiet:
         print("pushed %s to %s" % (plan.branch, remote))
+    return [line for line in err.splitlines() if line.startswith("remote:") and line[len("remote:"):].strip()]
 
 
 def github(repo: Repo, *args: str) -> str:
-    p = subprocess.run(["gh", *args], cwd=repo.top, stdout=subprocess.PIPE,
-                       stderr=subprocess.PIPE, text=True)
+    try:
+        p = subprocess.run(["gh", *args], cwd=repo.top, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, text=True)
+    except OSError as e:
+        raise SliceError("gh failed: %s" % e)
     if p.returncode:
         raise SliceError("gh failed: " + p.stderr.strip())
     return p.stdout.strip()
+
+
+def pull_request(repo: Repo, a: argparse.Namespace, plan: Plan, base: str) -> str:
+    """Reuse the open pull request from the export branch into the base, or create one, with gh."""
+    url = github(repo, "pr", "list", "--head", plan.branch, "--base", base, "--state", "open",
+                 "--json", "url", "--jq", ".[0].url")
+    if url:
+        return "using existing PR: %s" % url
+    commits = "\n".join("- %s (%s)" % (subject, short(sha))
+                        for sha, subject in source_commits(repo, plan, exported_since(plan, landed_only=True)))
+    body = "Slice `%s` (%s) from `%s`.\n\n%s" % (plan.sl.name, " ".join(plan.sl.paths), plan.frm, commits)
+    cmd = ["pr", "create", "--base", base, "--head", plan.branch,
+           "--title", a.title or "%s: %s" % (plan.sl.name, plan.frm), "--body", body]
+    if a.draft:
+        cmd.append("--draft")
+    return "created PR: %s" % github(repo, *cmd)
 
 
 # Commands
@@ -1201,8 +1224,6 @@ def cmd_update(repo: Repo, a: argparse.Namespace) -> int:
 
 
 def cmd_publish(repo: Repo, a: argparse.Namespace) -> int:
-    if not shutil.which("gh"):
-        raise SliceError("`gh` (GitHub CLI) is not installed")
     if not a.quiet:
         print("fetching %s" % a.remote)
     repo.run("fetch", a.remote)
@@ -1232,22 +1253,22 @@ def cmd_publish(repo: Repo, a: argparse.Namespace) -> int:
             print("no changes to publish")
         else:
             push(repo, plan, new, a.remote, force=a.rebuild, quiet=a.quiet)
-            print("no changes remain in %s; its pull request now shows none" % plan.branch)
+            print("no changes remain in %s; a pull request from it now shows none" % plan.branch)
         return 0
-    push(repo, plan, new, a.remote, force=a.rebuild, quiet=a.quiet)
-    url = github(repo, "pr", "list", "--head", plan.branch, "--base", base, "--state", "open",
-                 "--json", "url", "--jq", ".[0].url")
-    if url:
-        print("using existing PR: %s" % url)
-        return 0
-    commits = "\n".join("- %s (%s)" % (subject, short(sha))
-                        for sha, subject in source_commits(repo, plan, exported_since(plan, landed_only=True)))
-    body = "Slice `%s` (%s) from `%s`.\n\n%s" % (sl.name, " ".join(sl.paths), frm, commits)
-    cmd = ["pr", "create", "--base", base, "--head", plan.branch,
-           "--title", a.title or "%s: %s" % (sl.name, frm), "--body", body]
-    if a.draft:
-        cmd.append("--draft")
-    print("created PR: %s" % github(repo, *cmd))
+    messages = push(repo, plan, new, a.remote, force=a.rebuild, quiet=a.quiet)
+    # The export branch is published; the pull request needs gh and a repository on GitHub.
+    if shutil.which("gh"):
+        try:
+            print(pull_request(repo, a, plan, base))
+            return 0
+        except SliceError as e:
+            reason = str(e)
+    else:
+        reason = "gh, the GitHub CLI, is not installed"
+    if not a.quiet:
+        for line in messages:
+            print(line)
+    sys.stderr.write("note: no pull request was opened from %s into %s: %s\n" % (plan.branch, base, reason))
     return 0
 
 
@@ -1308,8 +1329,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser(
         "publish", aliases=["pr"], help="publish the source's changes to the slice as a pull request",
         description="Fetch the remote, add the source's latest changes to the slice's export branch, push it, "
-                    "then create or reuse an open PR against the base. The source branch remains unchanged. "
-                    "Merge the PR separately.",
+                    "then create or reuse an open PR against the base with the GitHub CLI (gh), if it is "
+                    "installed. The source branch remains unchanged. Merge the PR separately.",
         epilog="Example: git pathslice publish docs --from feature. "
                "Use 'git pathslice log docs' to preview the export. 'pr' is an alias for 'publish'.",
     )

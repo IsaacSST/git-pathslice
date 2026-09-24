@@ -21,13 +21,15 @@ base `main` and the upstream `dev`, so the export branch proposes to `main` only
 the feature's own documentation changes.
 
 Git computes each export with `git merge-tree`, without a worktree. Python
-manages configuration and the export branch. The GitHub CLI (`gh`) manages
-pull requests.
+manages configuration and the export branch. Pathslice works with any Git
+repository and remote; on GitHub, it opens pull requests with the GitHub CLI
+(`gh`) if that is installed.
 
 ## Installation
 
-Requires Git 2.40 or later and Python 3.9 or later. PR commands also require
-the GitHub CLI, authenticated with `gh auth login`.
+Requires Git 2.40 or later and Python 3.9 or later. To open pull requests on
+GitHub, `publish` also needs the GitHub CLI, authenticated with
+`gh auth login`.
 
 ```sh
 git clone https://github.com/IsaacSST/git-pathslice.git
@@ -80,6 +82,11 @@ git pathslice publish docs
 `publish` fetches the remote, adds the source branch's latest changes to the
 export branch, pushes it, then creates a PR or reuses an open one. `pr` is an
 alias for `publish`. Only committed changes are exported.
+
+If the GitHub CLI is not installed, or cannot open the PR, for example because
+the remote is not on GitHub, `publish` ends after the push with exit status 0.
+It prints the messages the server returned, such as a link for opening a pull
+request, and notes why no PR was opened.
 
 The export branch is named `pathslice/<slice>/<source branch>` unless
 `--branch NAME` chooses another. The slice, source branch and base are
