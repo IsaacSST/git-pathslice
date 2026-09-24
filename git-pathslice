@@ -523,18 +523,19 @@ def derived(repo: Repo, meta: Meta, name: str, scope: str) -> bool:
 
 
 def branch_mappings(repo: Repo) -> dict[str, dict[str, str]]:
-    """Export branches recorded in branch.<name>.pathsliceSlice and pathsliceSource."""
+    """Export branches recorded in branch.<name>.pathsliceSlice, pathsliceSource and pathsliceBase."""
     found: dict[str, dict[str, str]] = {}
-    for key, value in _config_entries(repo, r"^branch\..*\.pathslice(slice|source)$"):
+    for key, value in _config_entries(repo, r"^branch\..*\.pathslice(slice|source|base)$"):
         branch, _, var = key[len("branch."):].rpartition(".")
         found.setdefault(branch, {})[var] = value
     return found
 
 
-def record_branch(repo: Repo, branch: str, name: str, frm: str) -> None:
-    if branch_mappings(repo).get(branch) != {"pathsliceslice": name, "pathslicesource": frm}:
+def record_branch(repo: Repo, branch: str, name: str, frm: str, base: str) -> None:
+    if branch_mappings(repo).get(branch) != {"pathsliceslice": name, "pathslicesource": frm, "pathslicebase": base}:
         repo.run("config", "--local", "branch.%s.pathsliceSlice" % branch, name)
         repo.run("config", "--local", "branch.%s.pathsliceSource" % branch, frm)
+        repo.run("config", "--local", "branch.%s.pathsliceBase" % branch, base)
 
 
 def legacy_records(repo: Repo) -> list[dict[str, str]]:
@@ -554,17 +555,20 @@ def branch_name(name: str, frm: str) -> str:
     return "%s/%s/%s" % (BRANCH_ROOT, name, frm)
 
 
-def resolve_branch(repo: Repo, name: str, frm: str, branch: str | None = None) -> str:
+def resolve_branch(repo: Repo, name: str, frm: str, base: str, branch: str | None = None) -> str:
     if branch:
         return branch
-    mapped = sorted(b for b, m in branch_mappings(repo).items()
-                    if m.get("pathsliceslice") == name and m.get("pathslicesource") == frm)
+    mapped = {b: m for b, m in branch_mappings(repo).items()
+              if m.get("pathsliceslice") == name and m.get("pathslicesource") == frm}
+    # A slice and source can have one export branch for each base; older records lack the base.
+    candidates = (sorted(b for b, m in mapped.items() if m.get("pathslicebase") == base)
+                  or sorted(b for b, m in mapped.items() if not m.get("pathslicebase")))
     if not mapped:
-        mapped = sorted({r["branch"] for r in legacy_records(repo) if (r["slice"], r["source_ref"]) == (name, frm)})
-    if len(mapped) > 1:
-        raise SliceError("several branches export slice %s from %s (%s); choose one with --branch"
-                         % (name, frm, ", ".join(mapped)))
-    return mapped[0] if mapped else branch_name(name, frm)
+        candidates = sorted({r["branch"] for r in legacy_records(repo) if (r["slice"], r["source_ref"]) == (name, frm)})
+    if len(candidates) > 1:
+        raise SliceError("several branches export slice %s from %s onto %s (%s); choose one with --branch"
+                         % (name, frm, base, ", ".join(candidates)))
+    return candidates[0] if candidates else branch_name(name, frm)
 
 
 def _branch_part(repo: Repo, ref: str) -> str:
@@ -732,7 +736,7 @@ def make_plan(repo: Repo, sl: Slice, frm: str, base: str | None = None, branch: 
     merged = merged_commits(repo, sl, source, base)
     if not merged or merged[-1][0] != base:
         raise SliceError("%s shares no history with %s" % (frm, base))
-    name = resolve_branch(repo, sl.name, frm, branch)
+    name = resolve_branch(repo, sl.name, frm, base, branch)
     check_branch_name(repo, name, frm, base)
     ex = read_export(repo, sl, frm, name, base, base_tip, remote, fetched)
     if ex.last and not rebuild:
@@ -860,7 +864,7 @@ def apply(repo: Repo, plan: Plan, quiet: bool = False, rebuild: bool = False) ->
             print("note: " + note)
         if rebuild and ex.tip and ex.tip != plan.base_tip:
             move_branch(repo, plan, plan.base_tip)
-            record_branch(repo, plan.branch, plan.sl.name, plan.frm)
+            record_branch(repo, plan.branch, plan.sl.name, plan.frm, plan.base)
             if not quiet:
                 print("%s: started again at %s with nothing to export" % (plan.branch, plan.base))
             return plan.base_tip
@@ -873,7 +877,7 @@ def apply(repo: Repo, plan: Plan, quiet: bool = False, rebuild: bool = False) ->
         input=commit_message(repo, plan), env_extra=commit_identity(repo, plan.source, plan.parents)).strip()
     assert new is not None
     move_branch(repo, plan, new)
-    record_branch(repo, plan.branch, plan.sl.name, plan.frm)
+    record_branch(repo, plan.branch, plan.sl.name, plan.frm, plan.base)
     if not quiet:
         if not changed:
             fetched = " with %s/%s" % (ex.remote, plan.branch) if new != ex.local else ""
