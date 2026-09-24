@@ -131,10 +131,11 @@ While the PR is open, commit to the source branch and run `publish` again.
 Each update adds one commit to the export branch; earlier commits are not
 rewritten, so pushes are fast-forwards. The commit lists the source commits it
 covers. Its trailers record the slice (`Pathslice-Slice`), the source commit
-(`Pathslice-Source`) and the definition used (`Pathslice-Base`,
-`Pathslice-Upstream` and `Pathslice-Path`). Identities and dates are taken from
-the source commit and the parents, so identical inputs produce identical
-commits.
+(`Pathslice-Source`), the definition used (`Pathslice-Base`,
+`Pathslice-Upstream` and `Pathslice-Path`) and the tree computed for the export
+(`Pathslice-Target`), which the next update compares with the export branch to
+find changes made on it. Identities and dates are taken from the source commit
+and the parents, so identical inputs produce identical commits.
 
 A change to the slice's paths or upstream takes effect at the next update,
 which compares the new export with the one made under the recorded definition.

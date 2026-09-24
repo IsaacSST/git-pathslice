@@ -436,6 +436,34 @@ class TestExportBranch(Base):
         self.assertIn("is up to date", out)
         self.assertNotIn("lacks", out)
 
+    def test_exports_without_a_recorded_target_are_continued(self):
+        self.dev()
+        self.slice("update", "docs", "--from", "dev")
+        # Make the export commit again without its Pathslice-Target trailer, as version 0.3.0 wrote it.
+        info = self.git("log", "-1", "--date=raw", "--format=%an%n%ae%n%ad%n%cn%n%ce%n%cd%n%T%n%P", BRANCH).split("\n")
+        message = os.path.join(self.tmp, "message")
+        with open(message, "w") as f:
+            f.writelines(line for line in self.git("log", "-1", "--format=%B", BRANCH).splitlines(True)
+                         if not line.startswith("Pathslice-Target:"))
+        env = dict(self.env, GIT_AUTHOR_NAME=info[0], GIT_AUTHOR_EMAIL=info[1], GIT_AUTHOR_DATE="@" + info[2],
+                   GIT_COMMITTER_NAME=info[3], GIT_COMMITTER_EMAIL=info[4], GIT_COMMITTER_DATE="@" + info[5])
+        self.git("update-ref", "refs/heads/" + BRANCH,
+                 self.git("commit-tree", info[6], "-p", info[7], "-F", message, env=env).strip())
+        self.switch(BRANCH)
+        self.commit("Apply suggestion from review", {"docs/index.md": "intro, reviewed\n"})
+        self.switch("main")
+        self.later()
+        out = self.slice("update", "docs", "--from", "dev").stdout
+        self.assertIn("has changes that dev lacks in:\n  docs/index.md", out)
+        self.assertEqual(self.show(BRANCH, "docs/index.md"), "intro, reviewed\n")
+        self.assertTrue(self.exists(BRANCH, "docs/later.md"))
+        self.assertIn("Pathslice-Target: ", self.git("log", "-1", "--format=%B", BRANCH))
+        # The recorded tree is not part of the branch's history; without it, the update computes it again.
+        self.git("prune", "--expire=now")
+        updated = self.sha(BRANCH)
+        self.assertIn("is up to date", self.slice("update", "docs", "--from", "dev").stdout)
+        self.assertEqual(self.sha(BRANCH), updated)
+
     def test_conflicting_review_commit_is_refused_until_rebuilt(self):
         self.dev()
         self.slice("update", "docs", "--from", "dev")
